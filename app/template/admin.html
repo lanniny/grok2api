@@ -1640,7 +1640,7 @@
     const updateBatchActions = () => { const ba = $('batchActions'), sc = $('selectedCount'), c = selectedTokens.size; ba.classList[c > 0 ? 'add' : 'remove']('flex'); ba.classList[c > 0 ? 'remove' : 'add']('hidden'); c > 0 && (sc.textContent = `已选择 ${c} 项`); $('selectAll').checked = filteredTokens.length > 0 && c === filteredTokens.length };
     const filterTokens = () => { currentTokenPage = 1; loadTokens(); const tagf = $('filterTag').value; if (tagf !== 'all') { filteredTokens = allTokens.filter(t => t.tags && t.tags.includes(tagf)); renderTokens(); } };
     const loadAllTags = async () => { try { const r = await apiRequest('/api/tokens/tags/all'); if (!r) return; const d = await r.json(); if (d.success) { allTagsList = d.data; const tagFilter = $('filterTag'); const currentValue = tagFilter.value; tagFilter.innerHTML = '<option value="all">全部标签</option>' + allTagsList.map(tag => `<option value="${tag}">${tag}</option>`).join(''); tagFilter.value = currentValue } } catch (e) { console.error('加载标签列表失败:', e) } };
-    const refreshTokens = async () => { await loadTokens(); await loadStats() };
+    const refreshTokens = async () => { await loadTokens(); await loadStats(); await loadRequestStats() };
     const refreshAllTokens = async () => {
       if (!confirm('确定要刷新所有Token的剩余次数吗？这可能需要一段时间...')) return;
 

@@ -383,6 +383,13 @@
                 <path d="M16 21h5v-5" />
               </svg>
             </button>
+            <button onclick="validateAllTokens()" class="btn-icon" title="验证所有Token有效性（失效的将被标记）">
+              <svg class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                stroke="currentColor" stroke-width="2">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+            </button>
             <div id="batchActions" class="hidden items-center gap-2">
               <button onclick="exportSelected()" class="btn-icon" title="导出选中项">
                 <svg class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
@@ -1680,6 +1687,54 @@
         await refreshTokens();
       } catch (e) {
         showToast('刷新失败: ' + e.message, 'error');
+      }
+    };
+    const validateAllTokens = async () => {
+      if (!confirm('确定要验证所有Token的有效性吗？失效的Token将被标记为"失效"状态。')) return;
+
+      try {
+        const r = await apiRequest('/api/tokens/validate-all', { method: 'POST', body: JSON.stringify({ scope: 'active', concurrency: 5, batch_size: 500 }) });
+        if (!r) return;
+        const d = await r.json();
+
+        if (!d.success && d.data?.running) {
+          showToast('有任务正在进行中，请稍后再试', 'error');
+          return;
+        }
+
+        if (!d.success) {
+          showToast(d.message || '启动验证失败', 'error');
+          return;
+        }
+
+        showToast(`验证任务已启动，共 ${d.data?.total || 0} 个Token...`, 'info');
+        await new Promise(resolve => setTimeout(resolve, 300));
+
+        while (true) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          try {
+            const pr = await apiRequest('/api/tokens/refresh-progress');
+            if (!pr) break;
+            const pd = await pr.json();
+            if (pd.success && pd.data) {
+              const { current, total, success, failed, running } = pd.data;
+
+              if (!running) {
+                showToast(`验证完成: 有效 ${success} 个, 失效 ${failed} 个`, failed > 0 ? 'warning' : 'success');
+                break;
+              }
+
+              if (total > 0) {
+                const pct = Math.round((current / total) * 100);
+                showToast(`验证进度: ${current}/${total} (${pct}%) | 有效: ${success} 失效: ${failed}`, 'info');
+              }
+            }
+          } catch (e) { break; }
+        }
+
+        await refreshTokens();
+      } catch (e) {
+        showToast('验证失败: ' + e.message, 'error');
       }
     };
     const openAddModal = () => $('addModal').classList.remove('hidden');

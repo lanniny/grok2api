@@ -408,6 +408,103 @@ adminRoutes.get("/api/tokens/refresh-progress", requireAdminAuth, async (c) => {
   }
 });
 
+// 批量验证 Token 有效性
+adminRoutes.post("/api/tokens/validate-all", requireAdminAuth, async (c) => {
+  try {
+    const progress = await getRefreshProgress(c.env.DB);
+    if (progress.running) {
+      return c.json({ success: false, message: "有任务正在进行中，请稍后再试", data: progress });
+    }
+
+    const body = (await c.req.json().catch(() => ({}))) as { scope?: string; concurrency?: number; batch_size?: number };
+    const scope = body.scope ?? "active"; // all, active, unused
+    const concurrency = Math.min(10, Math.max(1, body.concurrency ?? 5));
+    const batchSize = Math.min(1000, Math.max(50, body.batch_size ?? 500));
+
+    const allTokens = await listTokens(c.env.DB);
+    const now = Date.now();
+
+    // 根据 scope 筛选
+    const tokensToValidate = allTokens.filter((t) => {
+      if (t.status === "expired") return false;
+      if (scope === "all") return true;
+      if (scope === "unused") {
+        return t.token_type === "ssoSuper"
+          ? t.remaining_queries === -1 && t.heavy_remaining_queries === -1
+          : t.remaining_queries === -1;
+      }
+      // active: 非过期的
+      return true;
+    });
+
+    const tokens = tokensToValidate.slice(0, batchSize);
+    if (!tokens.length) {
+      return c.json({ success: true, message: "没有需要验证的Token", data: { total: 0 } });
+    }
+
+    await setRefreshProgress(c.env.DB, {
+      running: true,
+      current: 0,
+      total: tokens.length,
+      success: 0,
+      failed: 0,
+    });
+
+    const settings = await getSettings(c.env);
+    const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+
+    c.executionCtx.waitUntil(
+      (async () => {
+        let valid = 0;
+        let invalid = 0;
+        let processed = 0;
+
+        const validateToken = async (t: typeof tokens[0]) => {
+          const cookie = cf ? `sso-rw=${t.token};sso=${t.token};${cf}` : `sso-rw=${t.token};sso=${t.token}`;
+          try {
+            const r = await checkRateLimits(cookie, settings.grok, "grok-4-fast");
+            if (r) {
+              const remaining = (r as any).remainingTokens;
+              if (typeof remaining === "number") {
+                await updateTokenLimits(c.env.DB, t.token, { remaining_queries: remaining });
+                if (remaining > 0 && t.cooldown_until) {
+                  await c.env.DB.prepare("UPDATE tokens SET cooldown_until = NULL WHERE token = ?").bind(t.token).run();
+                }
+              }
+              return true;
+            }
+            // 无法获取信息，标记为过期
+            await c.env.DB.prepare("UPDATE tokens SET status = 'expired' WHERE token = ?").bind(t.token).run();
+            return false;
+          } catch (e) {
+            // 请求失败也标记为过期
+            await c.env.DB.prepare("UPDATE tokens SET status = 'expired' WHERE token = ?").bind(t.token).run();
+            return false;
+          }
+        };
+
+        for (let i = 0; i < tokens.length; i += concurrency) {
+          const batch = tokens.slice(i, i + concurrency);
+          const results = await Promise.all(batch.map(validateToken));
+          results.forEach((ok) => (ok ? valid++ : invalid++));
+          processed += batch.length;
+          await setRefreshProgress(c.env.DB, { running: true, current: processed, total: tokens.length, success: valid, failed: invalid });
+        }
+
+        await setRefreshProgress(c.env.DB, { running: false, current: tokens.length, total: tokens.length, success: valid, failed: invalid });
+      })(),
+    );
+
+    return c.json({
+      success: true,
+      message: `验证任务已启动，共 ${tokens.length} 个Token（并发: ${concurrency}）`,
+      data: { started: true, total: tokens.length, scope },
+    });
+  } catch (e) {
+    return c.json(jsonError(`验证失败: ${e instanceof Error ? e.message : String(e)}`, "VALIDATE_ALL_ERROR"), 500);
+  }
+});
+
 adminRoutes.get("/api/stats", requireAdminAuth, async (c) => {
   try {
     const rows = await listTokens(c.env.DB);

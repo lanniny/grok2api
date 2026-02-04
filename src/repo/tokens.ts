@@ -228,3 +228,7 @@ export async function updateTokenLimits(
   params.push(token);
   await dbRun(db, `UPDATE tokens SET ${parts.join(", ")} WHERE token = ?`, params);
 }
+
+export async function updateTokenStatus(db: Env["DB"], token: string, status: string): Promise<void> {
+  await dbRun(db, "UPDATE tokens SET status = ? WHERE token = ?", [status, token]);
+}

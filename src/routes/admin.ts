@@ -23,8 +23,10 @@ import {
   updateTokenNote,
   updateTokenTags,
   updateTokenLimits,
+  type TokenRow,
 } from "../repo/tokens";
 import { checkRateLimits } from "../grok/rateLimits";
+import { enableNSFW, disableNSFW } from "../grok/nsfw";
 import { addRequestLog, clearRequestLogs, getRequestLogs, getRequestStats } from "../repo/logs";
 import { getRefreshProgress, setRefreshProgress } from "../repo/refreshProgress";
 import {
@@ -575,5 +577,167 @@ adminRoutes.post("/api/logs/add", requireAdminAuth, async (c) => {
     return c.json({ success: true });
   } catch (e) {
     return c.json(jsonError(`写入失败: ${e instanceof Error ? e.message : String(e)}`, "LOG_ADD_ERROR"), 500);
+  }
+});
+
+// === NSFW 模式管理 ===
+adminRoutes.post("/api/tokens/nsfw/enable", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as { token?: string; token_type?: string };
+    const token_type = validateTokenType(String(body.token_type ?? ""));
+    const token = String(body.token ?? "");
+    if (!token) return c.json({ success: false, message: "Token不能为空" });
+
+    const settings = await getSettings(c.env);
+    const result = await enableNSFW(token, settings.grok);
+
+    if (result.success) {
+      // 更新 token 标签，添加 nsfw 标记
+      const rows = await listTokens(c.env.DB);
+      const row = rows.find((r) => r.token === token && r.token_type === token_type);
+      if (row) {
+        const currentTags = row.tags ? JSON.parse(row.tags) : [];
+        if (!currentTags.includes("nsfw")) {
+          currentTags.push("nsfw");
+          await updateTokenTags(c.env.DB, token, token_type, currentTags);
+        }
+      }
+    }
+
+    return c.json({ success: result.success, message: result.message, error: result.error });
+  } catch (e) {
+    return c.json(jsonError(`开启NSFW失败: ${e instanceof Error ? e.message : String(e)}`, "NSFW_ENABLE_ERROR"), 500);
+  }
+});
+
+adminRoutes.post("/api/tokens/nsfw/disable", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as { token?: string; token_type?: string };
+    const token_type = validateTokenType(String(body.token_type ?? ""));
+    const token = String(body.token ?? "");
+    if (!token) return c.json({ success: false, message: "Token不能为空" });
+
+    const settings = await getSettings(c.env);
+    const result = await disableNSFW(token, settings.grok);
+
+    if (result.success) {
+      // 更新 token 标签，移除 nsfw 标记
+      const rows = await listTokens(c.env.DB);
+      const row = rows.find((r) => r.token === token && r.token_type === token_type);
+      if (row) {
+        const currentTags = row.tags ? JSON.parse(row.tags) : [];
+        const idx = currentTags.indexOf("nsfw");
+        if (idx >= 0) {
+          currentTags.splice(idx, 1);
+          await updateTokenTags(c.env.DB, token, token_type, currentTags);
+        }
+      }
+    }
+
+    return c.json({ success: result.success, message: result.message, error: result.error });
+  } catch (e) {
+    return c.json(jsonError(`关闭NSFW失败: ${e instanceof Error ? e.message : String(e)}`, "NSFW_DISABLE_ERROR"), 500);
+  }
+});
+
+adminRoutes.post("/api/tokens/nsfw/enable-batch", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as { tokens?: Array<{ token: string; token_type: string }> };
+    const tokens = Array.isArray(body.tokens) ? body.tokens : [];
+    if (!tokens.length) return c.json({ success: false, message: "Token列表不能为空" });
+
+    const settings = await getSettings(c.env);
+    let success = 0;
+    let failed = 0;
+
+    // 后台执行批量 NSFW 开启
+    c.executionCtx.waitUntil(
+      (async () => {
+        for (const t of tokens) {
+          const result = await enableNSFW(t.token, settings.grok);
+          if (result.success) {
+            success += 1;
+            // 更新标签
+            const rows = await listTokens(c.env.DB);
+            const row = rows.find((r) => r.token === t.token && r.token_type === t.token_type);
+            if (row) {
+              const currentTags = row.tags ? JSON.parse(row.tags) : [];
+              if (!currentTags.includes("nsfw")) {
+                currentTags.push("nsfw");
+                await updateTokenTags(c.env.DB, t.token, t.token_type as "sso" | "ssoSuper", currentTags);
+              }
+            }
+          } else {
+            failed += 1;
+          }
+          // 避免请求过快
+          await new Promise((res) => setTimeout(res, 200));
+        }
+      })(),
+    );
+
+    return c.json({ success: true, message: `批量NSFW开启任务已启动，共 ${tokens.length} 个Token` });
+  } catch (e) {
+    return c.json(jsonError(`批量NSFW失败: ${e instanceof Error ? e.message : String(e)}`, "NSFW_BATCH_ERROR"), 500);
+  }
+});
+
+// === Token 导出 ===
+adminRoutes.get("/api/tokens/export", requireAdminAuth, async (c) => {
+  try {
+    const format = c.req.query("format") ?? "json";
+    const status = c.req.query("status"); // active, expired, cooling, exhausted, nsfw
+    const rows = await listTokens(c.env.DB);
+    const now = Date.now();
+
+    // 状态筛选
+    let filtered = rows;
+    if (status) {
+      filtered = rows.filter((r) => {
+        if (status === "expired") return r.status === "expired";
+        if (status === "cooling") return r.cooldown_until && r.cooldown_until > now;
+        if (status === "exhausted") {
+          const isExhausted = r.token_type === "ssoSuper"
+            ? r.remaining_queries === 0 || r.heavy_remaining_queries === 0
+            : r.remaining_queries === 0;
+          return isExhausted && r.status !== "expired";
+        }
+        if (status === "nsfw") {
+          const tags = r.tags ? JSON.parse(r.tags) : [];
+          return tags.includes("nsfw");
+        }
+        if (status === "active") {
+          if (r.status === "expired") return false;
+          if (r.cooldown_until && r.cooldown_until > now) return false;
+          const isExhausted = r.token_type === "ssoSuper"
+            ? r.remaining_queries === 0 || r.heavy_remaining_queries === 0
+            : r.remaining_queries === 0;
+          return !isExhausted;
+        }
+        return true;
+      });
+    }
+
+    if (format === "csv") {
+      const header = "token,token_type,status,remaining_queries,heavy_remaining_queries,tags,note,created_time";
+      const lines = filtered.map((r) => {
+        const tags = r.tags ? JSON.parse(r.tags).join(";") : "";
+        return `${r.token},${r.token_type},${r.status},${r.remaining_queries},${r.heavy_remaining_queries},"${tags}","${r.note ?? ""}",${r.created_time}`;
+      });
+      const csv = [header, ...lines].join("\n");
+
+      return new Response(csv, {
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="tokens_${Date.now()}.csv"`,
+        },
+      });
+    }
+
+    // JSON 格式
+    const data = filtered.map(tokenRowToInfo);
+    return c.json({ success: true, data, total: data.length });
+  } catch (e) {
+    return c.json(jsonError(`导出失败: ${e instanceof Error ? e.message : String(e)}`, "EXPORT_ERROR"), 500);
   }
 });

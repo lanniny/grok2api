@@ -4,10 +4,8 @@ import type { Env } from "../env";
 import { requireApiAuth } from "../auth";
 import { getSettings, normalizeCfCookie } from "../settings";
 import { isValidModel, MODEL_CONFIG } from "../grok/models";
-import { extractContent, buildConversationPayload, sendConversationRequest } from "../grok/conversation";
-import { uploadImage } from "../grok/upload";
-import { createPost } from "../grok/create";
-import { createOpenAiStreamFromGrokNdjson, parseOpenAiFromGrokNdjson } from "../grok/processor";
+import { buildConversationPayload, sendConversationRequest } from "../grok/conversation";
+import { parseOpenAiFromGrokNdjson, createOpenAiStreamFromGrokNdjson } from "../grok/processor";
 import { addRequestLog } from "../repo/logs";
 import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
 import type { ApiAuthInfo } from "../auth";
@@ -24,26 +22,9 @@ function getClientIp(req: Request): string {
   );
 }
 
-async function mapLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = [];
-  const queue = items.slice();
-  const workers = Array.from({ length: Math.max(1, limit) }, async () => {
-    while (queue.length) {
-      const item = queue.shift() as T;
-      results.push(await fn(item));
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
+export const imagesRoutes = new Hono<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo } }>();
 
-export const openAiRoutes = new Hono<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo } }>();
-
-openAiRoutes.use(
+imagesRoutes.use(
   "/*",
   cors({
     origin: "*",
@@ -53,118 +34,66 @@ openAiRoutes.use(
   }),
 );
 
-openAiRoutes.use("/*", requireApiAuth);
+imagesRoutes.use("/*", requireApiAuth);
 
-openAiRoutes.get("/models", async (c) => {
-  const ts = Math.floor(Date.now() / 1000);
-  const data = Object.entries(MODEL_CONFIG).map(([id, cfg]) => ({
-    id,
-    object: "model",
-    created: ts,
-    owned_by: "x-ai",
-    display_name: cfg.display_name,
-    description: cfg.description,
-    raw_model_path: cfg.raw_model_path,
-    default_temperature: cfg.default_temperature,
-    default_max_output_tokens: cfg.default_max_output_tokens,
-    supported_max_output_tokens: cfg.supported_max_output_tokens,
-    default_top_p: cfg.default_top_p,
-  }));
-  return c.json({ object: "list", data });
-});
-
-openAiRoutes.get("/models/:modelId", async (c) => {
-  const modelId = c.req.param("modelId");
-  if (!isValidModel(modelId)) return c.json(openAiError(`Model '${modelId}' not found`, "model_not_found"), 404);
-  const cfg = MODEL_CONFIG[modelId]!;
-  const ts = Math.floor(Date.now() / 1000);
-  return c.json({
-    id: modelId,
-    object: "model",
-    created: ts,
-    owned_by: "x-ai",
-    display_name: cfg.display_name,
-    description: cfg.description,
-    raw_model_path: cfg.raw_model_path,
-    default_temperature: cfg.default_temperature,
-    default_max_output_tokens: cfg.default_max_output_tokens,
-    supported_max_output_tokens: cfg.supported_max_output_tokens,
-    default_top_p: cfg.default_top_p,
-  });
-});
-
-openAiRoutes.post("/chat/completions", async (c) => {
+// POST /v1/images/generations
+imagesRoutes.post("/generations", async (c) => {
   const start = Date.now();
   const ip = getClientIp(c.req.raw);
   const keyName = c.get("apiAuth").name ?? "Unknown";
-
   const origin = new URL(c.req.url).origin;
 
-  let requestedModel = "";
   try {
     const body = (await c.req.json()) as {
       model?: string;
-      messages?: any[];
+      prompt?: string;
+      n?: number;
+      size?: string;
+      response_format?: "url" | "b64_json";
       stream?: boolean;
-      thinking?: "enabled" | "disabled" | null;
-      video_config?: {
-        aspect_ratio?: string;
-        video_length?: number;
-        resolution?: string;
-        preset?: string;
-      };
     };
 
-    requestedModel = String(body.model ?? "");
-    if (!requestedModel) return c.json(openAiError("Missing 'model'", "missing_model"), 400);
-    if (!Array.isArray(body.messages)) return c.json(openAiError("Missing 'messages'", "missing_messages"), 400);
-    if (!isValidModel(requestedModel))
-      return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
+    const model = String(body.model ?? "grok-imagine-1.0");
+    const prompt = String(body.prompt ?? "");
+    const n = Math.min(4, Math.max(1, Number(body.n ?? 1)));
+    const responseFormat = body.response_format ?? "url";
+    const stream = Boolean(body.stream);
+
+    if (!prompt) return c.json(openAiError("Missing 'prompt'", "missing_prompt"), 400);
+    if (!isValidModel(model))
+      return c.json(openAiError(`Model '${model}' not supported`, "model_not_supported"), 400);
 
     const settingsBundle = await getSettings(c.env);
-
     const retryCodes = Array.isArray(settingsBundle.grok.retry_status_codes)
       ? settingsBundle.grok.retry_status_codes
       : [401, 429];
 
-    const stream = Boolean(body.stream);
     const maxRetry = 3;
     let lastErr: string | null = null;
 
     for (let attempt = 0; attempt < maxRetry; attempt++) {
-      const chosen = await selectBestToken(c.env.DB, requestedModel);
+      const chosen = await selectBestToken(c.env.DB, model);
       if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
 
       const jwt = chosen.token;
       const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
       const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
 
-      const { content, images } = extractContent(body.messages as any);
-      const cfg = MODEL_CONFIG[requestedModel]!;
-      const isVideoModel = Boolean(cfg.is_video_model);
-      const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
-
       try {
-        const uploads = await mapLimit(imgInputs, 5, (u) => uploadImage(u, cookie, settingsBundle.grok));
-        const imgIds = uploads.map((u) => u.fileId).filter(Boolean);
-        const imgUris = uploads.map((u) => u.fileUri).filter(Boolean);
-
-        let postId: string | undefined;
-        if (isVideoModel && imgUris.length) {
-          const post = await createPost(imgUris[0]!, cookie, settingsBundle.grok);
-          postId = post.postId || undefined;
-        }
+        // 构建图像生成 prompt
+        const imagePrompt = `Generate ${n} image(s): ${prompt}`;
 
         const { payload, referer } = buildConversationPayload({
-          requestModel: requestedModel,
-          content,
-          imgIds,
-          imgUris,
-          ...(postId ? { postId } : {}),
+          requestModel: model,
+          content: imagePrompt,
+          imgIds: [],
+          imgUris: [],
           settings: settingsBundle.grok,
-          thinking: body.thinking,
-          videoConfig: body.video_config,
         });
+
+        // 强制开启图像生成
+        (payload as any).enableImageGeneration = true;
+        (payload as any).imageGenerationCount = n;
 
         const upstream = await sendConversationRequest({
           payload,
@@ -191,7 +120,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
                 ip,
-                model: requestedModel,
+                model,
                 duration: Number(duration.toFixed(2)),
                 status,
                 key_name: keyName,
@@ -213,18 +142,39 @@ openAiRoutes.post("/chat/completions", async (c) => {
           });
         }
 
+        // 非流式：解析响应并提取图像 URL
         const json = await parseOpenAiFromGrokNdjson(upstream, {
           cookie,
           settings: settingsBundle.grok,
           global: settingsBundle.global,
           origin,
-          requestedModel,
+          requestedModel: model,
+        });
+
+        // 从响应中提取图像
+        const imageUrls: string[] = [];
+        const content = (json as any)?.choices?.[0]?.message?.content ?? "";
+
+        // 解析 markdown 图片格式 ![...](url)
+        const imgRegex = /!\[.*?\]\((https?:\/\/[^\s)]+)\)/g;
+        let match;
+        while ((match = imgRegex.exec(content)) !== null) {
+          imageUrls.push(match[1]);
+        }
+
+        // 构建 OpenAI 兼容的图像响应
+        const imageData = imageUrls.slice(0, n).map((url) => {
+          if (responseFormat === "b64_json") {
+            // TODO: 如需 base64，需要额外 fetch 图片并转换
+            return { url };
+          }
+          return { url };
         });
 
         const duration = (Date.now() - start) / 1000;
         await addRequestLog(c.env.DB, {
           ip,
-          model: requestedModel,
+          model,
           duration: Number(duration.toFixed(2)),
           status: 200,
           key_name: keyName,
@@ -232,7 +182,10 @@ openAiRoutes.post("/chat/completions", async (c) => {
           error: "",
         });
 
-        return c.json(json);
+        return c.json({
+          created: Math.floor(Date.now() / 1000),
+          data: imageData,
+        });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         lastErr = msg;
@@ -245,7 +198,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
     const duration = (Date.now() - start) / 1000;
     await addRequestLog(c.env.DB, {
       ip,
-      model: requestedModel,
+      model,
       duration: Number(duration.toFixed(2)),
       status: 500,
       key_name: keyName,
@@ -258,7 +211,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
     const duration = (Date.now() - start) / 1000;
     await addRequestLog(c.env.DB, {
       ip,
-      model: requestedModel || "unknown",
+      model: "grok-imagine-1.0",
       duration: Number(duration.toFixed(2)),
       status: 500,
       key_name: keyName,
@@ -269,4 +222,4 @@ openAiRoutes.post("/chat/completions", async (c) => {
   }
 });
 
-openAiRoutes.options("/*", (c) => c.body(null, 204));
+imagesRoutes.options("/*", (c) => c.body(null, 204));

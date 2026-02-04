@@ -29,5 +29,6 @@ KV_CACHE_MAX_BYTES = "26214400"
 KV_CLEANUP_BATCH = "200"
 
 [triggers]
-# Every day at 00:00 (Asia/Shanghai => 16:00 UTC)
-crons = ["0 16 * * *"]
+# Every day at 00:00 (Asia/Shanghai => 16:00 UTC) for daily cleanup
+# Every 8 hours (00:00, 08:00, 16:00 UTC) for token refresh
+crons = ["0 16 * * *", "0 0,8,16 * * *"]

@@ -28,6 +28,13 @@ export interface GrokSettings {
   stream_chunk_timeout?: number;
   stream_total_timeout?: number;
   retry_status_codes?: number[];
+  // 新增配置项
+  filter_tags?: string[];
+  base_proxy_url?: string;
+  asset_proxy_url?: string;
+  thinking?: boolean; // 默认思考模式
+  timeout?: number;
+  max_retry?: number;
 }
 
 export interface SettingsBundle {
@@ -61,6 +68,13 @@ const DEFAULTS: SettingsBundle = {
     stream_chunk_timeout: 120,
     stream_total_timeout: 600,
     retry_status_codes: [401, 429],
+    // 新增配置项默认值
+    filter_tags: [],
+    base_proxy_url: "",
+    asset_proxy_url: "",
+    thinking: false,
+    timeout: 30000,
+    max_retry: 3,
   },
 };
 

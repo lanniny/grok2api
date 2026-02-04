@@ -1,13 +1,16 @@
 import { Hono } from "hono";
 import type { Env } from "./env";
 import { openAiRoutes } from "./routes/openai";
+import { imagesRoutes } from "./routes/images";
 import { mediaRoutes } from "./routes/media";
 import { adminRoutes } from "./routes/admin";
 import { runKvDailyClear } from "./kv/cleanup";
+import { refreshCoolingTokens, cleanupExpiredTokens } from "./kv/tokenRefresh";
 
 const app = new Hono<{ Bindings: Env }>();
 
 app.route("/v1", openAiRoutes);
+app.route("/v1/images", imagesRoutes);
 app.route("/", mediaRoutes);
 app.route("/", adminRoutes);
 
@@ -40,8 +43,13 @@ app.notFound((c) => {
 
 const handler: ExportedHandler<Env> = {
   fetch: (request, env, ctx) => app.fetch(request, env, ctx),
-  scheduled: (_event, env, ctx) => {
+  scheduled: (event, env, ctx) => {
+    // 每日清理 (UTC 16:00 = 北京时间 00:00)
     ctx.waitUntil(runKvDailyClear(env));
+    // Token 刷新 (每 8 小时)
+    ctx.waitUntil(refreshCoolingTokens(env));
+    // 清理过期 Token
+    ctx.waitUntil(cleanupExpiredTokens(env));
   },
 };
 

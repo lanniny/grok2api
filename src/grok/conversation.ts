@@ -53,26 +53,50 @@ export function buildConversationPayload(args: {
   imgUris: string[];
   postId?: string;
   settings: GrokSettings;
+  thinking?: "enabled" | "disabled" | null;
+  videoConfig?: {
+    aspect_ratio?: string;
+    video_length?: number;
+    resolution?: string;
+  };
 }): { payload: Record<string, unknown>; referer?: string; isVideoModel: boolean } {
-  const { requestModel, content, imgIds, imgUris, postId, settings } = args;
+  const { requestModel, content, imgIds, imgUris, postId, settings, thinking, videoConfig } = args;
   const cfg = getModelInfo(requestModel);
   const { grokModel, mode, isVideoModel } = toGrokModel(requestModel);
 
   if (cfg?.is_video_model && imgUris.length) {
     const ref = postId ? `https://grok.com/imagine/${postId}` : `https://assets.grok.com/post/${imgUris[0]}`;
     const referer = postId ? `https://grok.com/imagine/${postId}` : undefined;
+    const videoPayload: Record<string, unknown> = {
+      temporary: true,
+      modelName: "grok-3",
+      message: `${ref}  ${content} --mode=custom`,
+      fileAttachments: imgIds,
+      toolOverrides: { videoGen: true },
+    };
+    // 添加视频配置
+    if (videoConfig) {
+      videoPayload.responseMetadata = {
+        modelConfigOverride: {
+          modelMap: {
+            videoGenModelConfig: {
+              aspectRatio: videoConfig.aspect_ratio || "3:2",
+              videoLength: videoConfig.video_length || 6,
+              videoResolution: videoConfig.resolution || "SD",
+            },
+          },
+        },
+      };
+    }
     return {
       isVideoModel: true,
       ...(referer ? { referer } : {}),
-      payload: {
-        temporary: true,
-        modelName: "grok-3",
-        message: `${ref}  ${content} --mode=custom`,
-        fileAttachments: imgIds,
-        toolOverrides: { videoGen: true },
-      },
+      payload: videoPayload,
     };
   }
+
+  // 计算 isReasoning: thinking === "enabled" 时开启，thinking === "disabled" 时关闭，null/undefined 使用默认
+  const isReasoning = thinking === "enabled" ? true : thinking === "disabled" ? false : false;
 
   return {
     isVideoModel,
@@ -92,7 +116,7 @@ export function buildConversationPayload(args: {
       toolOverrides: {},
       enableSideBySide: true,
       sendFinalMetadata: true,
-      isReasoning: false,
+      isReasoning,
       webpageUrls: [],
       disableTextFollowUps: true,
       responseMetadata: { requestModelDetails: { modelId: grokModel } },

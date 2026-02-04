@@ -9,9 +9,21 @@ export interface ModelInfo {
   supported_max_output_tokens: number;
   default_top_p: number;
   is_video_model?: boolean;
+  is_image_model?: boolean;
 }
 
 export const MODEL_CONFIG: Record<string, ModelInfo> = {
+  "grok-3": {
+    grok_model: ["grok-3", "MODEL_MODE_AUTO"],
+    rate_limit_model: "grok-3",
+    display_name: "Grok 3",
+    description: "Standard Grok 3 model",
+    raw_model_path: "xai/grok-3",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+  },
   "grok-3-fast": {
     grok_model: ["grok-3", "MODEL_MODE_FAST"],
     rate_limit_model: "grok-3",
@@ -78,6 +90,28 @@ export const MODEL_CONFIG: Record<string, ModelInfo> = {
     supported_max_output_tokens: 131072,
     default_top_p: 0.95,
   },
+  "grok-4-mini": {
+    grok_model: ["grok-4-mini-thinking-tahoe", "MODEL_MODE_GROK_4_MINI_THINKING"],
+    rate_limit_model: "grok-4-mini-thinking-tahoe",
+    display_name: "Grok 4 Mini",
+    description: "Lightweight Grok 4 model with thinking capabilities",
+    raw_model_path: "xai/grok-4-mini-thinking-tahoe",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+  },
+  "grok-4.1": {
+    grok_model: ["grok-4-1-thinking-1129", "MODEL_MODE_AUTO"],
+    rate_limit_model: "grok-4-1-thinking-1129",
+    display_name: "Grok 4.1",
+    description: "Grok 4.1 model with advanced capabilities",
+    raw_model_path: "xai/grok-4-1-thinking-1129",
+    default_temperature: 1.0,
+    default_max_output_tokens: 32768,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+  },
   "grok-4.1-thinking": {
     grok_model: ["grok-4-1-thinking-1129", "MODEL_MODE_AUTO"],
     rate_limit_model: "grok-4-1-thinking-1129",
@@ -101,6 +135,30 @@ export const MODEL_CONFIG: Record<string, ModelInfo> = {
     default_top_p: 0.95,
     is_video_model: true,
   },
+  "grok-imagine-1.0": {
+    grok_model: ["grok-3", "MODEL_MODE_FAST"],
+    rate_limit_model: "grok-3",
+    display_name: "Grok Imagine 1.0",
+    description: "Image generation model for text-to-image generation.",
+    raw_model_path: "xai/grok-imagine-1.0",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+    is_image_model: true,
+  },
+  "grok-imagine-1.0-video": {
+    grok_model: ["grok-3", "MODEL_MODE_FAST"],
+    rate_limit_model: "grok-3",
+    display_name: "Grok Imagine 1.0 Video",
+    description: "Video generation model. Supports image-to-video generation.",
+    raw_model_path: "xai/grok-imagine-1.0-video",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+    is_video_model: true,
+  },
 };
 
 export function isValidModel(model: string): boolean {
@@ -111,10 +169,15 @@ export function getModelInfo(model: string): ModelInfo | null {
   return MODEL_CONFIG[model] ?? null;
 }
 
-export function toGrokModel(model: string): { grokModel: string; mode: string; isVideoModel: boolean } {
+export function toGrokModel(model: string): { grokModel: string; mode: string; isVideoModel: boolean; isImageModel: boolean } {
   const cfg = MODEL_CONFIG[model];
-  if (!cfg) return { grokModel: model, mode: "MODEL_MODE_FAST", isVideoModel: false };
-  return { grokModel: cfg.grok_model[0], mode: cfg.grok_model[1], isVideoModel: Boolean(cfg.is_video_model) };
+  if (!cfg) return { grokModel: model, mode: "MODEL_MODE_FAST", isVideoModel: false, isImageModel: false };
+  return {
+    grokModel: cfg.grok_model[0],
+    mode: cfg.grok_model[1],
+    isVideoModel: Boolean(cfg.is_video_model),
+    isImageModel: Boolean(cfg.is_image_model),
+  };
 }
 
 export function toRateLimitModel(model: string): string {

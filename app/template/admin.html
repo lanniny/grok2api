@@ -454,6 +454,22 @@
           </svg>
           <p class="text-sm text-muted-foreground">暂无数据</p>
         </div>
+
+        <!-- Token 分页控件 -->
+        <div id="tokenPagination" class="flex items-center justify-between mt-4 px-2">
+          <div class="text-sm text-muted-foreground">
+            共 <span id="tokenTotalCount">0</span> 条，当前显示 <span id="tokenCurrentRange">0-0</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <button id="tokenPrevBtn" onclick="changeTokenPage(-1)" class="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors border border-input bg-background hover:bg-accent h-8 px-3 disabled:opacity-50 disabled:pointer-events-none">上一页</button>
+            <span class="text-sm">第 <span id="tokenCurrentPage">1</span> / <span id="tokenMaxPage">1</span> 页</span>
+            <button id="tokenNextBtn" onclick="changeTokenPage(1)" class="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors border border-input bg-background hover:bg-accent h-8 px-3 disabled:opacity-50 disabled:pointer-events-none">下一页</button>
+            <select id="tokenPageSize" onchange="changeTokenPageSize()" class="h-8 rounded-md border border-input bg-background px-2 text-sm">
+              <option value="50">50条/页</option>
+              <option value="100">100条/页</option>
+            </select>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1184,6 +1200,7 @@
 
   <script>
     let allTokens = [], filteredTokens = [], selectedTokens = new Set(), allTagsList = [];
+    let currentTokenPage = 1, tokensPerPage = 50, totalTokens = 0;
     let allLogsData = [], currentLogPage = 1, logsPerPage = 20;
     const selectedKeys = new Set();
     const $ = (id) => document.getElementById(id);
@@ -1502,10 +1519,22 @@
     const calcRemaining = () => { let n = 0, h = 0; allTokens.forEach(t => { if (t.remaining_queries > 0) n += t.remaining_queries; if (t.heavy_remaining_queries > 0) h += t.heavy_remaining_queries }); return { normal: n, heavy: h, total: n + h } };
     const loadTokens = async () => {
       try {
-        const r = await apiRequest('/api/tokens');
+        const tf = $('filterType').value;
+        const sf = $('filterStatus').value;
+        const params = new URLSearchParams({
+          limit: tokensPerPage.toString(),
+          offset: ((currentTokenPage - 1) * tokensPerPage).toString(),
+        });
+        if (tf !== 'all') params.set('token_type', tf);
+        if (sf !== 'all') {
+          const statusMap = { '正常': 'active', '失效': 'expired', '冷却中': 'cooling', '额度耗尽': 'exhausted' };
+          if (statusMap[sf]) params.set('status', statusMap[sf]);
+        }
+        const r = await apiRequest('/api/tokens?' + params.toString());
         if (!r) return;
         const d = await r.json();
         if (d.success) {
+          totalTokens = d.total || 0;
           allTokens = d.data.map(t => ({
             ...t,
             tags: t.tags || [],
@@ -1519,10 +1548,35 @@
           filteredTokens = allTokens;
           selectedTokens.clear();
           renderTokens();
+          updateTokenPagination();
           updateRemaining();
           await loadAllTags();
         }
       } catch (e) { console.error('加载列表失败:', e) }
+    };
+    const updateTokenPagination = () => {
+      const maxPage = Math.max(1, Math.ceil(totalTokens / tokensPerPage));
+      const start = (currentTokenPage - 1) * tokensPerPage + 1;
+      const end = Math.min(currentTokenPage * tokensPerPage, totalTokens);
+      $('tokenTotalCount').textContent = totalTokens;
+      $('tokenCurrentRange').textContent = totalTokens > 0 ? `${start}-${end}` : '0-0';
+      $('tokenCurrentPage').textContent = currentTokenPage;
+      $('tokenMaxPage').textContent = maxPage;
+      $('tokenPrevBtn').disabled = currentTokenPage <= 1;
+      $('tokenNextBtn').disabled = currentTokenPage >= maxPage;
+    };
+    const changeTokenPage = (delta) => {
+      const maxPage = Math.max(1, Math.ceil(totalTokens / tokensPerPage));
+      const newPage = currentTokenPage + delta;
+      if (newPage >= 1 && newPage <= maxPage) {
+        currentTokenPage = newPage;
+        loadTokens();
+      }
+    };
+    const changeTokenPageSize = () => {
+      tokensPerPage = parseInt($('tokenPageSize').value, 10);
+      currentTokenPage = 1;
+      loadTokens();
     };
     const updateRemaining = () => { const r = calcRemaining(); const chatTotal = r.total; const imageTotal = Math.floor(chatTotal / 2); $('statChatRemaining').textContent = chatTotal === 0 ? '-' : chatTotal.toLocaleString(); $('statImageRemaining').textContent = imageTotal === 0 ? '-' : imageTotal.toLocaleString(); $('statVideoRemaining').textContent = '无法统计' };
     const formatDuration = (seconds) => {
@@ -1577,7 +1631,7 @@
     const toggleToken = t => selectedTokens[selectedTokens.has(t) ? 'delete' : 'add'](t) || updateBatchActions();
     const toggleSelectAll = () => { const sa = $('selectAll'); sa.checked ? filteredTokens.forEach(t => selectedTokens.add(t.token)) : selectedTokens.clear(); renderTokens() };
     const updateBatchActions = () => { const ba = $('batchActions'), sc = $('selectedCount'), c = selectedTokens.size; ba.classList[c > 0 ? 'add' : 'remove']('flex'); ba.classList[c > 0 ? 'remove' : 'add']('hidden'); c > 0 && (sc.textContent = `已选择 ${c} 项`); $('selectAll').checked = filteredTokens.length > 0 && c === filteredTokens.length };
-    const filterTokens = () => { const tf = $('filterType').value, sf = $('filterStatus').value, tagf = $('filterTag').value; filteredTokens = allTokens.filter(t => (tf === 'all' || t.token_type === tf) && (sf === 'all' || t.status === sf) && (tagf === 'all' || t.tags && t.tags.includes(tagf))); selectedTokens.clear(); renderTokens() };
+    const filterTokens = () => { currentTokenPage = 1; loadTokens(); const tagf = $('filterTag').value; if (tagf !== 'all') { filteredTokens = allTokens.filter(t => t.tags && t.tags.includes(tagf)); renderTokens(); } };
     const loadAllTags = async () => { try { const r = await apiRequest('/api/tokens/tags/all'); if (!r) return; const d = await r.json(); if (d.success) { allTagsList = d.data; const tagFilter = $('filterTag'); const currentValue = tagFilter.value; tagFilter.innerHTML = '<option value="all">全部标签</option>' + allTagsList.map(tag => `<option value="${tag}">${tag}</option>`).join(''); tagFilter.value = currentValue } } catch (e) { console.error('加载标签列表失败:', e) } };
     const refreshTokens = async () => { await loadTokens(); await loadStats() };
     const refreshAllTokens = async () => {

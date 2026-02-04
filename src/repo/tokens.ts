@@ -96,6 +96,111 @@ export async function listTokens(db: Env["DB"]): Promise<TokenRow[]> {
   );
 }
 
+export async function listTokensPaged(
+  db: Env["DB"],
+  options: {
+    limit?: number;
+    offset?: number;
+    status?: string;
+    token_type?: TokenType;
+    search?: string;
+  },
+): Promise<{ rows: TokenRow[]; total: number }> {
+  const limit = Math.min(100, Math.max(1, options.limit ?? 50));
+  const offset = Math.max(0, options.offset ?? 0);
+
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  if (options.token_type) {
+    conditions.push("token_type = ?");
+    params.push(options.token_type);
+  }
+
+  if (options.status === "expired") {
+    conditions.push("status = 'expired'");
+  } else if (options.status === "cooling") {
+    conditions.push("cooldown_until > ?");
+    params.push(nowMs());
+  } else if (options.status === "exhausted") {
+    conditions.push("status != 'expired'");
+    conditions.push("(remaining_queries = 0 OR (token_type = 'ssoSuper' AND heavy_remaining_queries = 0))");
+  } else if (options.status === "active") {
+    conditions.push("status != 'expired'");
+    conditions.push("(cooldown_until IS NULL OR cooldown_until <= ?)");
+    params.push(nowMs());
+    conditions.push("remaining_queries != 0");
+  }
+
+  if (options.search) {
+    conditions.push("(token LIKE ? OR note LIKE ?)");
+    const like = `%${options.search}%`;
+    params.push(like, like);
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const countRow = await dbFirst<{ c: number }>(
+    db,
+    `SELECT COUNT(1) as c FROM tokens ${where}`,
+    params,
+  );
+  const total = countRow?.c ?? 0;
+
+  const rows = await dbAll<TokenRow>(
+    db,
+    `SELECT token, token_type, created_time, remaining_queries, heavy_remaining_queries, status, tags, note, cooldown_until, last_failure_time, last_failure_reason, failed_count FROM tokens ${where} ORDER BY created_time DESC LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+
+  return { rows, total };
+}
+
+export async function getTokenStats(db: Env["DB"]): Promise<{
+  total: number;
+  active: number;
+  expired: number;
+  cooling: number;
+  exhausted: number;
+  unused: number;
+}> {
+  const now = nowMs();
+  const rows = await dbAll<{ status: string; cooldown_until: number | null; remaining_queries: number; heavy_remaining_queries: number; token_type: string }>(
+    db,
+    "SELECT status, cooldown_until, remaining_queries, heavy_remaining_queries, token_type FROM tokens",
+  );
+
+  let active = 0, expired = 0, cooling = 0, exhausted = 0, unused = 0;
+
+  for (const r of rows) {
+    if (r.status === "expired") {
+      expired++;
+      continue;
+    }
+    if (r.cooldown_until && r.cooldown_until > now) {
+      cooling++;
+      continue;
+    }
+    const isUnused = r.token_type === "ssoSuper"
+      ? r.remaining_queries === -1 && r.heavy_remaining_queries === -1
+      : r.remaining_queries === -1;
+    if (isUnused) {
+      unused++;
+      continue;
+    }
+    const isExhausted = r.token_type === "ssoSuper"
+      ? r.remaining_queries === 0 || r.heavy_remaining_queries === 0
+      : r.remaining_queries === 0;
+    if (isExhausted) {
+      exhausted++;
+      continue;
+    }
+    active++;
+  }
+
+  return { total: rows.length, active, expired, cooling, exhausted, unused };
+}
+
 export async function addTokens(db: Env["DB"], tokens: string[], token_type: TokenType): Promise<number> {
   const now = nowMs();
   const cleaned = tokens.map((t) => t.trim()).filter(Boolean);

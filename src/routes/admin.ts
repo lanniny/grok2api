@@ -19,6 +19,8 @@ import {
   deleteTokens,
   getAllTags,
   listTokens,
+  listTokensPaged,
+  getTokenStats,
   tokenRowToInfo,
   updateTokenNote,
   updateTokenTags,
@@ -131,11 +133,40 @@ adminRoutes.get("/api/storage/mode", requireAdminAuth, async (c) => {
 
 adminRoutes.get("/api/tokens", requireAdminAuth, async (c) => {
   try {
-    const rows = await listTokens(c.env.DB);
+    const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? 50)));
+    const offset = Math.max(0, Number(c.req.query("offset") ?? 0));
+    const status = c.req.query("status"); // active, expired, cooling, exhausted
+    const token_type = c.req.query("token_type") as "sso" | "ssoSuper" | undefined;
+    const search = c.req.query("search");
+
+    const { rows, total } = await listTokensPaged(c.env.DB, {
+      limit,
+      offset,
+      status,
+      token_type: token_type && (token_type === "sso" || token_type === "ssoSuper") ? token_type : undefined,
+      search,
+    });
+
     const infos = rows.map(tokenRowToInfo);
-    return c.json({ success: true, data: infos, total: infos.length });
+    return c.json({
+      success: true,
+      data: infos,
+      total,
+      limit,
+      offset,
+      has_more: offset + infos.length < total,
+    });
   } catch (e) {
     return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "TOKENS_LIST_ERROR"), 500);
+  }
+});
+
+adminRoutes.get("/api/tokens/stats", requireAdminAuth, async (c) => {
+  try {
+    const stats = await getTokenStats(c.env.DB);
+    return c.json({ success: true, data: stats });
+  } catch (e) {
+    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "TOKENS_STATS_ERROR"), 500);
   }
 });
 

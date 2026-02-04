@@ -99,11 +99,11 @@ export async function listTokens(db: Env["DB"]): Promise<TokenRow[]> {
 export async function listTokensPaged(
   db: Env["DB"],
   options: {
-    limit?: number;
-    offset?: number;
-    status?: string;
-    token_type?: TokenType;
-    search?: string;
+    limit?: number | undefined;
+    offset?: number | undefined;
+    status?: string | undefined;
+    token_type?: TokenType | undefined;
+    search?: string | undefined;
   },
 ): Promise<{ rows: TokenRow[]; total: number }> {
   const limit = Math.min(100, Math.max(1, options.limit ?? 50));

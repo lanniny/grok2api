@@ -159,7 +159,7 @@ imagesRoutes.post("/generations", async (c) => {
         const imgRegex = /!\[.*?\]\((https?:\/\/[^\s)]+)\)/g;
         let match;
         while ((match = imgRegex.exec(content)) !== null) {
-          imageUrls.push(match[1]);
+          if (match[1]) imageUrls.push(match[1]);
         }
 
         // 构建 OpenAI 兼容的图像响应

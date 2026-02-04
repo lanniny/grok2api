@@ -49,7 +49,7 @@ export async function enableNSFW(token: string, settings: GrokSettings): Promise
     const response = await fetch(NSFW_API, {
       method: "POST",
       headers,
-      body: payload,
+      body: payload.buffer,
     });
 
     if (!response.ok) {
@@ -119,7 +119,7 @@ export async function disableNSFW(token: string, settings: GrokSettings): Promis
     const response = await fetch(NSFW_API, {
       method: "POST",
       headers,
-      body: payload,
+      body: payload.buffer,
     });
 
     if (!response.ok) {

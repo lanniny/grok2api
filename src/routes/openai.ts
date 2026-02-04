@@ -162,7 +162,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
           imgUris,
           ...(postId ? { postId } : {}),
           settings: settingsBundle.grok,
-          thinking: body.thinking,
+          thinking: body.thinking ?? null,
           videoConfig: body.video_config,
         });
 

@@ -53,12 +53,13 @@ export function buildConversationPayload(args: {
   imgUris: string[];
   postId?: string;
   settings: GrokSettings;
-  thinking?: "enabled" | "disabled" | null;
+  thinking?: "enabled" | "disabled" | null | undefined;
   videoConfig?: {
     aspect_ratio?: string;
     video_length?: number;
     resolution?: string;
-  };
+    preset?: string;
+  } | undefined;
 }): { payload: Record<string, unknown>; referer?: string; isVideoModel: boolean } {
   const { requestModel, content, imgIds, imgUris, postId, settings, thinking, videoConfig } = args;
   const cfg = getModelInfo(requestModel);

@@ -297,7 +297,46 @@ adminRoutes.post("/api/tokens/refresh-all", requireAdminAuth, async (c) => {
       return c.json({ success: false, message: "刷新任务正在进行中", data: progress });
     }
 
-    const tokens = await listTokens(c.env.DB);
+    const body = (await c.req.json().catch(() => ({}))) as { scope?: string; concurrency?: number; batch_size?: number };
+    const scope = body.scope ?? "need_refresh"; // all, need_refresh, cooling, exhausted, unused
+    const concurrency = Math.min(10, Math.max(1, body.concurrency ?? 5));
+    const batchSize = Math.min(500, Math.max(50, body.batch_size ?? 200)); // 每批最多处理数量
+
+    const allTokens = await listTokens(c.env.DB);
+    const now = Date.now();
+
+    // 根据 scope 筛选需要刷新的 token
+    const tokensToRefresh = allTokens.filter((t) => {
+      if (t.status === "expired") return false; // 跳过已过期
+      if (scope === "all") return true;
+      if (scope === "cooling") return t.cooldown_until && t.cooldown_until > now;
+      if (scope === "exhausted") {
+        return t.token_type === "ssoSuper"
+          ? t.remaining_queries === 0 || t.heavy_remaining_queries === 0
+          : t.remaining_queries === 0;
+      }
+      if (scope === "unused") {
+        return t.token_type === "ssoSuper"
+          ? t.remaining_queries === -1 && t.heavy_remaining_queries === -1
+          : t.remaining_queries === -1;
+      }
+      // need_refresh: 冷却中 + 耗尽 + 未使用
+      const isCooling = t.cooldown_until && t.cooldown_until > now;
+      const isExhausted = t.token_type === "ssoSuper"
+        ? t.remaining_queries === 0 || t.heavy_remaining_queries === 0
+        : t.remaining_queries === 0;
+      const isUnused = t.token_type === "ssoSuper"
+        ? t.remaining_queries === -1 && t.heavy_remaining_queries === -1
+        : t.remaining_queries === -1;
+      return isCooling || isExhausted || isUnused;
+    });
+
+    // 限制本次处理数量
+    const tokens = tokensToRefresh.slice(0, batchSize);
+    if (!tokens.length) {
+      return c.json({ success: true, message: "没有需要刷新的Token", data: { total: 0 } });
+    }
+
     await setRefreshProgress(c.env.DB, {
       running: true,
       current: 0,
@@ -313,25 +352,48 @@ adminRoutes.post("/api/tokens/refresh-all", requireAdminAuth, async (c) => {
       (async () => {
         let success = 0;
         let failed = 0;
-        for (let i = 0; i < tokens.length; i++) {
-          const t = tokens[i]!;
+        let processed = 0;
+
+        // 并发处理函数
+        const processToken = async (t: typeof tokens[0]) => {
           const cookie = cf ? `sso-rw=${t.token};sso=${t.token};${cf}` : `sso-rw=${t.token};sso=${t.token}`;
-          const r = await checkRateLimits(cookie, settings.grok, "grok-4-fast");
-          if (r) {
-            const remaining = (r as any).remainingTokens;
-            if (typeof remaining === "number") await updateTokenLimits(c.env.DB, t.token, { remaining_queries: remaining });
-            success += 1;
-          } else {
-            failed += 1;
+          try {
+            const r = await checkRateLimits(cookie, settings.grok, "grok-4-fast");
+            if (r) {
+              const remaining = (r as any).remainingTokens;
+              if (typeof remaining === "number") {
+                await updateTokenLimits(c.env.DB, t.token, { remaining_queries: remaining });
+                // 如果恢复了额度，清除冷却时间
+                if (remaining > 0 && t.cooldown_until) {
+                  await c.env.DB.prepare("UPDATE tokens SET cooldown_until = NULL WHERE token = ?").bind(t.token).run();
+                }
+              }
+              return true;
+            }
+          } catch (e) {
+            // 忽略错误
           }
-          await setRefreshProgress(c.env.DB, { running: true, current: i + 1, total: tokens.length, success, failed });
-          await new Promise((res) => setTimeout(res, 100));
+          return false;
+        };
+
+        // 分批并发处理
+        for (let i = 0; i < tokens.length; i += concurrency) {
+          const batch = tokens.slice(i, i + concurrency);
+          const results = await Promise.all(batch.map(processToken));
+          results.forEach((ok) => (ok ? success++ : failed++));
+          processed += batch.length;
+          await setRefreshProgress(c.env.DB, { running: true, current: processed, total: tokens.length, success, failed });
         }
+
         await setRefreshProgress(c.env.DB, { running: false, current: tokens.length, total: tokens.length, success, failed });
       })(),
     );
 
-    return c.json({ success: true, message: "刷新任务已启动", data: { started: true } });
+    return c.json({
+      success: true,
+      message: `刷新任务已启动，共 ${tokens.length} 个Token（筛选范围: ${scope}，并发: ${concurrency}）`,
+      data: { started: true, total: tokens.length, filtered_from: tokensToRefresh.length, scope },
+    });
   } catch (e) {
     return c.json(jsonError(`刷新失败: ${e instanceof Error ? e.message : String(e)}`, "REFRESH_ALL_ERROR"), 500);
   }

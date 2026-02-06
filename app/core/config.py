@@ -148,20 +148,38 @@ class ConfigManager:
     async def save(self, global_config: Optional[Dict[str, Any]] = None, grok_config: Optional[Dict[str, Any]] = None) -> None:
         """保存配置"""
         updates = {}
-        
+
         if global_config:
             updates["global"] = global_config
         if grok_config:
             updates["grok"] = self._prepare_grok(grok_config)
-        
+
         # 选择存储方式
         if self._storage:
             await self._save_storage(updates)
         else:
             await self._save_file(updates)
-        
+
         await self.reload()
+
+        # 通知依赖方重置缓存
+        self._notify_config_changed()
     
+    def _notify_config_changed(self) -> None:
+        """通知依赖方配置已变更"""
+        # 重置上传信号量
+        try:
+            from app.services.grok.client import GrokClient
+            GrokClient._upload_sem = None
+        except ImportError:
+            pass
+        # 重置聊天并发信号量
+        try:
+            from app.api.v1.chat import reset_chat_semaphore
+            reset_chat_semaphore()
+        except ImportError:
+            pass
+
     async def get_proxy_async(self, proxy_type: Literal["service", "cache"] = "service") -> str:
         """异步获取代理URL（支持代理池）
         

@@ -13,6 +13,7 @@ from app.models.grok_models import TokenType, Models
 from app.core.exception import GrokApiException
 from app.core.logger import logger
 from app.core.config import setting
+from app.core.retry import async_request_with_retry
 from app.services.grok.statsig import get_dynamic_headers
 
 
@@ -59,6 +60,7 @@ class GrokTokenManager:
         # 冷却状态
         self._cooldown_counts: Dict[str, int] = {}  # Token -> 剩余冷却次数
         self._request_counter = 0  # 全局请求计数器
+        self._round_robin_index = 0  # 轮询索引
         
         # 刷新状态
         self._refresh_lock = False  # 刷新锁
@@ -280,22 +282,22 @@ class GrokTokenManager:
         current_time = time.time() * 1000  # 毫秒
         
         def select_best(tokens: Dict[str, Any], field: str) -> Tuple[Optional[str], Optional[int]]:
-            """选择最佳Token"""
+            """选择最佳Token（轮询策略）"""
             unused, used = [], []
 
             for key, data in tokens.items():
                 # 跳过已失效的token
                 if data.get("status") == "expired":
                     continue
-                
+
                 # 跳过失败次数过多的token（任何错误状态码）
                 if data.get("failedCount", 0) >= MAX_FAILURES:
                     continue
-                
+
                 # 跳过次数冷却中的token
                 if key in self._cooldown_counts:
                     continue
-                
+
                 # 跳过时间冷却中的token（429）
                 cooldown_until = data.get("cooldownUntil", 0)
                 if cooldown_until and cooldown_until > current_time:
@@ -310,12 +312,22 @@ class GrokTokenManager:
                 elif remaining > 0:
                     used.append((key, remaining))
 
-            if unused:
-                return unused[0], -1
+            # 合并候选列表：未使用优先，已使用按剩余排序
+            candidates = unused.copy()
             if used:
                 used.sort(key=lambda x: x[1], reverse=True)
-                return used[0][0], used[0][1]
-            return None, None
+                candidates.extend([k for k, _ in used])
+
+            if not candidates:
+                return None, None
+
+            # 轮询选择
+            idx = self._round_robin_index % len(candidates)
+            selected = candidates[idx]
+            self._round_robin_index += 1
+
+            remaining = -1 if selected in unused else dict(used).get(selected, -1)
+            return selected, remaining
 
         # 快照
         snapshot = {
@@ -354,98 +366,52 @@ class GrokTokenManager:
         try:
             rate_model = Models.to_rate_limit(model)
             payload = {"requestKind": "DEFAULT", "modelName": rate_model}
-            
+
             cf = setting.grok_config.get("cf_clearance", "")
             headers = get_dynamic_headers("/rest/rate-limits")
             headers["Cookie"] = f"{auth_token};{cf}" if cf else auth_token
 
-            # 外层重试：可配置状态码（401/429等）
-            retry_codes = setting.grok_config.get("retry_status_codes", [401, 429])
-            MAX_OUTER_RETRY = 3
-            
-            for outer_retry in range(MAX_OUTER_RETRY + 1):  # +1 确保实际重试3次
-                # 内层重试：403代理池重试
-                max_403_retries = 5
-                retry_403_count = 0
-                
-                while retry_403_count <= max_403_retries:
-                    # 异步获取代理（支持代理池）
-                    from app.core.proxy_pool import proxy_pool
-                    
-                    # 如果是403重试且使用代理池，强制刷新代理
-                    if retry_403_count > 0 and proxy_pool._enabled:
-                        logger.info(f"[Token] 403重试 {retry_403_count}/{max_403_retries}，刷新代理...")
-                        proxy = await proxy_pool.force_refresh()
+            async def do_request(proxy, retry_info):
+                proxies = {"http": proxy, "https": proxy} if proxy else None
+                async with AsyncSession() as session:
+                    response = await session.post(
+                        RATE_LIMIT_API,
+                        headers=headers,
+                        json=payload,
+                        impersonate=BROWSER,
+                        timeout=TIMEOUT,
+                        proxies=proxies
+                    )
+                    if response.status_code != 200:
+                        return {"status_code": response.status_code, "response": response}
+                    return response.json()
+
+            result = await async_request_with_retry(do_request, log_prefix="[Token]")
+
+            # 重试用尽
+            if isinstance(result, dict) and "status_code" in result:
+                status_code = result["status_code"]
+                sso = self._extract_sso(auth_token)
+                if sso:
+                    if status_code == 403:
+                        await self.record_failure(auth_token, 403, "服务器被Block")
+                    elif status_code == 401:
+                        await self.record_failure(auth_token, 401, "Token失效")
                     else:
-                        proxy = await setting.get_proxy_async("service")
-                    
-                    proxies = {"http": proxy, "https": proxy} if proxy else None
-                    
-                    async with AsyncSession() as session:
-                        response = await session.post(
-                            RATE_LIMIT_API,
-                            headers=headers,
-                            json=payload,
-                            impersonate=BROWSER,
-                            timeout=TIMEOUT,
-                            proxies=proxies
-                        )
+                        await self.record_failure(auth_token, status_code, f"错误: {status_code}")
+                return None
 
-                        # 内层403重试：仅当有代理池时触发
-                        if response.status_code == 403 and proxy_pool._enabled:
-                            retry_403_count += 1
-                            
-                            if retry_403_count <= max_403_retries:
-                                logger.warning(f"[Token] 遇到403错误，正在重试 ({retry_403_count}/{max_403_retries})...")
-                                await asyncio.sleep(0.5)
-                                continue
-                            
-                            # 内层重试全部失败
-                            logger.error(f"[Token] 403错误，已重试{retry_403_count-1}次，放弃")
-                            sso = self._extract_sso(auth_token)
-                            if sso:
-                                await self.record_failure(auth_token, 403, "服务器被Block")
-                        
-                        # 检查可配置状态码错误 - 外层重试
-                        if response.status_code in retry_codes:
-                            if outer_retry < MAX_OUTER_RETRY:
-                                delay = (outer_retry + 1) * 0.1  # 渐进延迟：0.1s, 0.2s, 0.3s
-                                logger.warning(f"[Token] 遇到{response.status_code}错误，外层重试 ({outer_retry+1}/{MAX_OUTER_RETRY})，等待{delay}s...")
-                                await asyncio.sleep(delay)
-                                break  # 跳出内层循环，进入外层重试
-                            else:
-                                logger.error(f"[Token] {response.status_code}错误，已重试{outer_retry}次，放弃")
-                                sso = self._extract_sso(auth_token)
-                                if sso:
-                                    if response.status_code == 401:
-                                        await self.record_failure(auth_token, 401, "Token失效")
-                                    else:
-                                        await self.record_failure(auth_token, response.status_code, f"错误: {response.status_code}")
-                                return None
-
-                        if response.status_code == 200:
-                            data = response.json()
-                            sso = self._extract_sso(auth_token)
-                            
-                            if outer_retry > 0 or retry_403_count > 0:
-                                logger.info(f"[Token] 重试成功！")
-                            
-                            if sso:
-                                if model == "grok-4-heavy":
-                                    await self.update_limits(sso, normal=None, heavy=data.get("remainingQueries", -1))
-                                    logger.info(f"[Token] 更新限制: {sso[:10]}..., heavy={data.get('remainingQueries', -1)}")
-                                else:
-                                    await self.update_limits(sso, normal=data.get("remainingTokens", -1), heavy=None)
-                                    logger.info(f"[Token] 更新限制: {sso[:10]}..., basic={data.get('remainingTokens', -1)}")
-                            
-                            return data
-                        else:
-                            # 其他错误
-                            logger.warning(f"[Token] 获取限制失败: {response.status_code}")
-                            sso = self._extract_sso(auth_token)
-                            if sso:
-                                await self.record_failure(auth_token, response.status_code, f"错误: {response.status_code}")
-                            return None
+            # 成功
+            data = result
+            sso = self._extract_sso(auth_token)
+            if sso:
+                if model == "grok-4-heavy":
+                    await self.update_limits(sso, normal=None, heavy=data.get("remainingQueries", -1))
+                    logger.info(f"[Token] 更新限制: {sso[:10]}..., heavy={data.get('remainingQueries', -1)}")
+                else:
+                    await self.update_limits(sso, normal=data.get("remainingTokens", -1), heavy=None)
+                    logger.info(f"[Token] 更新限制: {sso[:10]}..., basic={data.get('remainingTokens', -1)}")
+            return data
 
         except Exception as e:
             logger.error(f"[Token] 检查限制错误: {e}")

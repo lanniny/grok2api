@@ -31,10 +31,10 @@ class OpenAIChatRequest(BaseModel):
                 raise HTTPException(status_code=400, detail="消息缺少 'role' 字段")
             if 'content' not in msg:
                 raise HTTPException(status_code=400, detail="消息缺少 'content' 字段")
-            if msg['role'] not in ['system', 'user', 'assistant']:
+            if msg['role'] not in ['system', 'user', 'assistant', 'tool', 'developer']:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"无效角色 '{msg['role']}', 必须是 system/user/assistant"
+                    detail=f"无效角色 '{msg['role']}', 必须是 system/user/assistant/tool/developer"
                 )
 
         return v

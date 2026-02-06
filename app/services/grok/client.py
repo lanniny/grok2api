@@ -7,6 +7,7 @@ from curl_cffi.requests import AsyncSession as curl_AsyncSession
 
 from app.core.config import setting
 from app.core.logger import logger
+from app.core.retry import async_request_with_retry
 from app.models.grok_models import Models
 from app.services.grok.processer import GrokResponseProcessor
 from app.services.grok.statsig import get_dynamic_headers
@@ -104,7 +105,9 @@ class GrokClient:
         role_map = {
             "system": "系统",
             "user": "用户",
-            "assistant": "grok"
+            "assistant": "grok",
+            "tool": "工具",
+            "developer": "系统"
         }
         
         for msg in messages:
@@ -214,108 +217,72 @@ class GrokClient:
         if not token:
             raise GrokApiException("认证令牌缺失", "NO_AUTH_TOKEN")
 
-        # 外层重试：可配置状态码（401/429等）
-        retry_codes = setting.grok_config.get("retry_status_codes", [401, 429])
-        MAX_OUTER_RETRY = 3
-        
-        for outer_retry in range(MAX_OUTER_RETRY + 1):  # +1 确保实际重试3次
-            # 内层重试：403代理池重试
-            max_403_retries = 5
-            retry_403_count = 0
-            
-            while retry_403_count <= max_403_retries:
-                # 异步获取代理
-                from app.core.proxy_pool import proxy_pool
-                
-                # 如果是403重试且使用代理池，强制刷新代理
-                if retry_403_count > 0 and proxy_pool._enabled:
-                    logger.info(f"[Client] 403重试 {retry_403_count}/{max_403_retries}，刷新代理...")
-                    proxy = await proxy_pool.force_refresh()
-                else:
-                    proxy = await setting.get_proxy_async("service")
-                
-                proxies = {"http": proxy, "https": proxy} if proxy else None
-                
-                # 构建请求头（放在循环内以支持重试新Token）
-                headers = GrokClient._build_headers(token)
-                if model == "grok-imagine-0.9":
-                    file_attachments = payload.get("fileAttachments", [])
-                    ref_id = post_id or (file_attachments[0] if file_attachments else "")
-                    if ref_id:
-                        headers["Referer"] = f"https://grok.com/imagine/{ref_id}"
+        # 保存session引用，流式时不关闭
+        _session_holder = {}
 
-                # 创建会话并执行请求
-                session = curl_AsyncSession(impersonate=BROWSER)
-                try:
-                    response = await session.post(
-                        API_ENDPOINT,
-                        headers=headers,
-                        data=orjson.dumps(payload),
-                        timeout=TIMEOUT,
-                        stream=True,
-                        proxies=proxies
-                    )
-                    
-                    # 内层403重试：仅当有代理池时触发
-                    if response.status_code == 403 and proxy_pool._enabled:
-                        retry_403_count += 1
-                        if retry_403_count <= max_403_retries:
-                            logger.warning(f"[Client] 遇到403错误，正在重试 ({retry_403_count}/{max_403_retries})...")
-                            await session.close()
-                            await asyncio.sleep(0.5)
-                            continue
-                        logger.error(f"[Client] 403错误，已重试{retry_403_count-1}次，放弃")
-                    
-                    # 检查可配置状态码错误 - 外层重试
-                    if response.status_code in retry_codes:
-                        if outer_retry < MAX_OUTER_RETRY:
-                            delay = (outer_retry + 1) * 0.1
-                            logger.warning(f"[Client] 遇到{response.status_code}错误，外层重试 ({outer_retry+1}/{MAX_OUTER_RETRY})，等待{delay}s...")
-                            await session.close()
-                            await asyncio.sleep(delay)
-                            break  # 跳出内层循环，进入外层重试
-                        else:
-                            logger.error(f"[Client] {response.status_code}错误，已重试{outer_retry}次，放弃")
-                            try:
-                                GrokClient._handle_error(response, token)
-                            finally:
-                                await session.close()
-                    
-                    # 检查其他响应状态
-                    if response.status_code != 200:
-                        try:
-                            GrokClient._handle_error(response, token)
-                        finally:
-                            await session.close()
-                    
-                    # 成功 - 重置失败计数
-                    asyncio.create_task(token_manager.reset_failure(token))
-                    
-                    if outer_retry > 0 or retry_403_count > 0:
-                        logger.info(f"[Client] 重试成功！")
-                    
-                    # 处理响应
-                    if stream:
-                        # 流式响应由迭代器负责关闭 session
-                        result = GrokResponseProcessor.process_stream(response, token, session)
-                    else:
-                        # 普通响应处理完立即关闭 session
-                        try:
-                            result = await GrokResponseProcessor.process_normal(response, token, model)
-                        finally:
-                            await session.close()
-                    
-                    asyncio.create_task(GrokClient._update_limits(token, model))
-                    return result
-                    
-                except Exception as e:
+        async def do_request(proxy, retry_info):
+            proxies = {"http": proxy, "https": proxy} if proxy else None
+
+            headers = GrokClient._build_headers(token)
+            if model == "grok-imagine-0.9":
+                file_attachments = payload.get("fileAttachments", [])
+                ref_id = post_id or (file_attachments[0] if file_attachments else "")
+                if ref_id:
+                    headers["Referer"] = f"https://grok.com/imagine/{ref_id}"
+
+            session = curl_AsyncSession(impersonate=BROWSER)
+            try:
+                response = await session.post(
+                    API_ENDPOINT,
+                    headers=headers,
+                    data=orjson.dumps(payload),
+                    timeout=TIMEOUT,
+                    stream=True,
+                    proxies=proxies
+                )
+
+                if response.status_code != 200:
                     await session.close()
-                    if "RequestsError" in str(type(e)):
-                        logger.error(f"[Client] 网络错误: {e}")
-                        raise GrokApiException(f"网络错误: {e}", "NETWORK_ERROR") from e
-                    raise
-        
-        raise GrokApiException("请求失败：已达到最大重试次数", "MAX_RETRIES_EXCEEDED")
+                    return {"status_code": response.status_code, "response": response}
+
+                # 成功
+                asyncio.create_task(token_manager.reset_failure(token))
+
+                if stream:
+                    _session_holder["session"] = session
+                    _session_holder["response"] = response
+                else:
+                    try:
+                        result = await GrokResponseProcessor.process_normal(response, token, model)
+                    finally:
+                        await session.close()
+                    _session_holder["result"] = result
+
+                return "SUCCESS"
+
+            except Exception as e:
+                await session.close()
+                if "RequestsError" in str(type(e)):
+                    raise GrokApiException(f"网络错误: {e}", "NETWORK_ERROR") from e
+                raise
+
+        result = await async_request_with_retry(do_request, log_prefix="[Client]")
+
+        # 处理重试用尽的情况
+        if isinstance(result, dict) and "status_code" in result:
+            response = result.get("response")
+            if response:
+                GrokClient._handle_error(response, token)
+            raise GrokApiException("请求失败：已达到最大重试次数", "MAX_RETRIES_EXCEEDED")
+
+        # 成功路径
+        asyncio.create_task(GrokClient._update_limits(token, model))
+
+        if stream:
+            return GrokResponseProcessor.process_stream(
+                _session_holder["response"], token, _session_holder["session"]
+            )
+        return _session_holder["result"]
 
 
     @staticmethod

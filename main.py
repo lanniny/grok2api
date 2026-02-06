@@ -2,6 +2,8 @@
 
 import os
 import sys
+import time
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,6 +20,9 @@ from app.api.v1.models import router as models_router
 from app.api.v1.images import router as images_router
 from app.api.admin.manage import router as admin_router
 from app.services.mcp import mcp
+
+VERSION = "1.4.3"
+_start_time = time.time()
 
 # 0. 兼容性检测
 try:
@@ -87,6 +92,13 @@ async def lifespan(app: FastAPI):
     # 4. 启动批量保存任务
     await token_manager.start_batch_save()
 
+    # 4.5. 启动统计模块批量保存
+    await request_stats.start_batch_save()
+
+    # 4.6. 启动会话过期清理任务
+    from app.api.admin.manage import cleanup_expired_sessions
+    _session_cleanup_task = asyncio.create_task(cleanup_expired_sessions())
+
     # 5. 管理MCP服务的生命周期
     mcp_lifespan_context = mcp_app.lifespan(app)
     await mcp_lifespan_context.__aenter__()
@@ -98,14 +110,25 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         # --- 关闭过程 ---
+        # 0. 取消会话清理任务
+        _session_cleanup_task.cancel()
+        try:
+            await _session_cleanup_task
+        except asyncio.CancelledError:
+            pass
+
         # 1. 退出MCP服务的生命周期
         await mcp_lifespan_context.__aexit__(None, None, None)
         logger.info("[MCP] MCP服务已关闭")
-        
+
         # 2. 关闭批量保存任务并刷新数据
         await token_manager.shutdown()
         logger.info("[Token] Token管理器已关闭")
-        
+
+        # 2.5 关闭统计模块
+        await request_stats.shutdown()
+        logger.info("[Stats] 统计模块已关闭")
+
         # 3. 关闭核心服务
         await storage_manager.close()
         logger.info("[Grok2API] 应用关闭成功")
@@ -119,8 +142,17 @@ logger.info("[Grok2API] Fork 版本维护: @Tomiya233")
 app = FastAPI(
     title="Grok2API",
     description="Grok API 转换服务",
-    version="1.3.1",
+    version=VERSION,
     lifespan=lifespan
+)
+
+# CORS中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 注册全局异常处理器
@@ -145,10 +177,22 @@ async def root():
 @app.get("/health")
 async def health_check():
     """健康检查接口"""
+    from app.models.grok_models import TokenType
+
+    all_tokens = token_manager.get_tokens()
+    normal_count = len(all_tokens.get(TokenType.NORMAL.value, {}))
+    super_count = len(all_tokens.get(TokenType.SUPER.value, {}))
+
     return {
         "status": "healthy",
         "service": "Grok2API",
-        "version": "1.0.3"
+        "version": VERSION,
+        "uptime_seconds": int(time.time() - _start_time),
+        "tokens": {
+            "normal": normal_count,
+            "super": super_count,
+            "total": normal_count + super_count,
+        }
     }
 
 # 挂载MCP服务器 

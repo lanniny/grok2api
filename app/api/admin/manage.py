@@ -5,7 +5,8 @@ import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Depends, Header, Query
+from collections import defaultdict
+from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -29,6 +30,13 @@ BYTES_PER_MB = 1024 * 1024
 
 # 会话存储
 _sessions: Dict[str, datetime] = {}
+
+# 登录限流
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 300  # 5分钟
+LOGIN_LOCKOUT_SECONDS = 900  # 锁定15分钟
+_login_attempts: Dict[str, List[float]] = defaultdict(list)
+_login_lockouts: Dict[str, float] = {}
 
 
 # === 请求/响应模型 ===
@@ -74,6 +82,9 @@ class TokenListResponse(BaseModel):
     success: bool
     data: List[TokenInfo]
     total: int
+    page: int = 1
+    page_size: int = 0
+    total_pages: int = 1
 
 
 class UpdateSettingsRequest(BaseModel):
@@ -190,17 +201,37 @@ def verify_admin_session(authorization: Optional[str] = Header(None)) -> bool:
     """验证管理员会话"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail={"error": "未授权访问", "code": "UNAUTHORIZED"})
-    
+
     token = authorization[7:]
-    
+
     if token not in _sessions:
         raise HTTPException(status_code=401, detail={"error": "会话无效", "code": "SESSION_INVALID"})
-    
+
     if datetime.now() > _sessions[token]:
         del _sessions[token]
         raise HTTPException(status_code=401, detail={"error": "会话已过期", "code": "SESSION_EXPIRED"})
-    
+
     return True
+
+
+async def cleanup_expired_sessions():
+    """定时清理过期会话（由 lifespan 调用）"""
+    import asyncio
+    while True:
+        await asyncio.sleep(3600)  # 每小时清理一次
+        now = datetime.now()
+        expired = [token for token, expire_at in _sessions.items() if now > expire_at]
+        for token in expired:
+            del _sessions[token]
+        if expired:
+            logger.debug(f"[Admin] 清理过期会话: {len(expired)}个")
+
+        # 同时清理过期的登录限流记录
+        now_ts = time.time()
+        expired_ips = [ip for ip, lockout_until in _login_lockouts.items() if now_ts > lockout_until]
+        for ip in expired_ips:
+            del _login_lockouts[ip]
+            _login_attempts.pop(ip, None)
 
 
 def get_token_status(token_data: Dict[str, Any], token_type: str) -> str:
@@ -271,22 +302,48 @@ async def manage_page():
 # === API端点 ===
 
 @router.post("/api/login", response_model=LoginResponse)
-async def admin_login(request: LoginRequest) -> LoginResponse:
-    """管理员登录"""
+async def admin_login(request: Request, body: LoginRequest) -> LoginResponse:
+    """管理员登录（带IP限流）"""
     try:
-        logger.debug(f"[Admin] 登录尝试: {request.username}")
+        ip = request.client.host
+        now = time.time()
+
+        # 检查是否被锁定
+        if ip in _login_lockouts:
+            if now < _login_lockouts[ip]:
+                remaining = int(_login_lockouts[ip] - now)
+                logger.warning(f"[Admin] 登录被锁定: {ip}，剩余{remaining}秒")
+                return LoginResponse(success=False, message=f"登录尝试过多，请{remaining}秒后重试")
+            else:
+                del _login_lockouts[ip]
+                _login_attempts.pop(ip, None)
+
+        logger.debug(f"[Admin] 登录尝试: {body.username}")
 
         expected_user = setting.global_config.get("admin_username", "")
         expected_pass = setting.global_config.get("admin_password", "")
 
-        if request.username != expected_user or request.password != expected_pass:
-            logger.warning(f"[Admin] 登录失败: {request.username}")
+        if body.username != expected_user or body.password != expected_pass:
+            # 记录失败
+            _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < LOGIN_WINDOW_SECONDS]
+            _login_attempts[ip].append(now)
+
+            if len(_login_attempts[ip]) >= LOGIN_MAX_ATTEMPTS:
+                _login_lockouts[ip] = now + LOGIN_LOCKOUT_SECONDS
+                logger.warning(f"[Admin] IP {ip} 登录失败{LOGIN_MAX_ATTEMPTS}次，锁定{LOGIN_LOCKOUT_SECONDS}秒")
+                return LoginResponse(success=False, message=f"登录尝试过多，请{LOGIN_LOCKOUT_SECONDS // 60}分钟后重试")
+
+            logger.warning(f"[Admin] 登录失败: {body.username}")
             return LoginResponse(success=False, message="用户名或密码错误")
+
+        # 成功 - 清除失败记录
+        _login_attempts.pop(ip, None)
+        _login_lockouts.pop(ip, None)
 
         session_token = secrets.token_urlsafe(32)
         _sessions[session_token] = datetime.now() + timedelta(hours=SESSION_EXPIRE_HOURS)
 
-        logger.debug(f"[Admin] 登录成功: {request.username}")
+        logger.debug(f"[Admin] 登录成功: {body.username}")
         return LoginResponse(success=True, token=session_token, message="登录成功")
 
     except Exception as e:
@@ -314,8 +371,14 @@ async def admin_logout(_: bool = Depends(verify_admin_session), authorization: O
 
 
 @router.get("/api/tokens", response_model=TokenListResponse)
-async def list_tokens(_: bool = Depends(verify_admin_session)) -> TokenListResponse:
-    """获取Token列表"""
+async def list_tokens(
+    _: bool = Depends(verify_admin_session),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(0, ge=0, le=1000, description="每页数量，0表示不分页"),
+    status_filter: Optional[str] = Query(None, description="状态筛选：active/expired/cooldown/exhausted"),
+    tag_filter: Optional[str] = Query(None, description="标签筛选"),
+) -> TokenListResponse:
+    """获取Token列表（支持分页和筛选）"""
     try:
         logger.debug("[Admin] 获取Token列表")
 
@@ -323,20 +386,23 @@ async def list_tokens(_: bool = Depends(verify_admin_session)) -> TokenListRespo
         token_list: List[TokenInfo] = []
         now_ms = int(time.time() * 1000)
 
-        # 普通Token
-        for token, data in all_tokens.get(TokenType.NORMAL.value, {}).items():
+        def build_token_info(token, data, token_type_str):
             cooldown_remaining_ms = _get_cooldown_remaining_ms(data, now_ms)
             cooldown_until = data.get("cooldownUntil") if cooldown_remaining_ms else None
             limit_reason = "cooldown" if cooldown_remaining_ms else ""
-            if not limit_reason and data.get("remainingQueries", -1) == 0:
-                limit_reason = "exhausted"
-            token_list.append(TokenInfo(
+            if not limit_reason:
+                if token_type_str == "ssoSuper":
+                    if data.get("remainingQueries", -1) == 0 or data.get("heavyremainingQueries", -1) == 0:
+                        limit_reason = "exhausted"
+                elif data.get("remainingQueries", -1) == 0:
+                    limit_reason = "exhausted"
+            return TokenInfo(
                 token=token,
-                token_type="sso",
+                token_type=token_type_str,
                 created_time=parse_created_time(data.get("createdTime")),
                 remaining_queries=data.get("remainingQueries", -1),
                 heavy_remaining_queries=data.get("heavyremainingQueries", -1),
-                status=get_token_status(data, "sso"),
+                status=get_token_status(data, token_type_str),
                 tags=data.get("tags", []),
                 note=data.get("note", ""),
                 cooldown_until=cooldown_until,
@@ -344,33 +410,46 @@ async def list_tokens(_: bool = Depends(verify_admin_session)) -> TokenListRespo
                 last_failure_time=data.get("lastFailureTime") or None,
                 last_failure_reason=data.get("lastFailureReason") or "",
                 limit_reason=limit_reason
-            ))
+            )
+
+        # 普通Token
+        for token, data in all_tokens.get(TokenType.NORMAL.value, {}).items():
+            token_list.append(build_token_info(token, data, "sso"))
 
         # Super Token
         for token, data in all_tokens.get(TokenType.SUPER.value, {}).items():
-            cooldown_remaining_ms = _get_cooldown_remaining_ms(data, now_ms)
-            cooldown_until = data.get("cooldownUntil") if cooldown_remaining_ms else None
-            limit_reason = "cooldown" if cooldown_remaining_ms else ""
-            if not limit_reason and (data.get("remainingQueries", -1) == 0 or data.get("heavyremainingQueries", -1) == 0):
-                limit_reason = "exhausted"
-            token_list.append(TokenInfo(
-                token=token,
-                token_type="ssoSuper",
-                created_time=parse_created_time(data.get("createdTime")),
-                remaining_queries=data.get("remainingQueries", -1),
-                heavy_remaining_queries=data.get("heavyremainingQueries", -1),
-                status=get_token_status(data, "ssoSuper"),
-                tags=data.get("tags", []),
-                note=data.get("note", ""),
-                cooldown_until=cooldown_until,
-                cooldown_remaining=(cooldown_remaining_ms + 999) // 1000 if cooldown_remaining_ms else 0,
-                last_failure_time=data.get("lastFailureTime") or None,
-                last_failure_reason=data.get("lastFailureReason") or "",
-                limit_reason=limit_reason
-            ))
+            token_list.append(build_token_info(token, data, "ssoSuper"))
 
-        logger.debug(f"[Admin] Token列表获取成功: {len(token_list)}个")
-        return TokenListResponse(success=True, data=token_list, total=len(token_list))
+        # 筛选
+        if status_filter:
+            status_map = {
+                "active": "正常",
+                "expired": "失效",
+                "cooldown": "冷却中",
+                "exhausted": "额度耗尽",
+                "unused": "未使用",
+            }
+            target_status = status_map.get(status_filter, status_filter)
+            token_list = [t for t in token_list if t.status == target_status]
+
+        if tag_filter:
+            token_list = [t for t in token_list if tag_filter in t.tags]
+
+        total = len(token_list)
+
+        # 分页
+        if page_size > 0:
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            start = (page - 1) * page_size
+            token_list = token_list[start:start + page_size]
+        else:
+            total_pages = 1
+
+        logger.debug(f"[Admin] Token列表获取成功: {total}个")
+        return TokenListResponse(
+            success=True, data=token_list, total=total,
+            page=page, page_size=page_size, total_pages=total_pages
+        )
 
     except Exception as e:
         logger.error(f"[Admin] 获取Token列表异常: {e}")

@@ -411,8 +411,13 @@ class GrokResponseProcessor:
         return content
 
     @staticmethod
-    def _build_response(content: str, model: str) -> OpenAIChatCompletionResponse:
+    def _build_response(content: str, model: str, prompt_text: str = "") -> OpenAIChatCompletionResponse:
         """构建响应对象"""
+        # 粗略估算 token 数（字符数/4）
+        prompt_tokens = max(len(prompt_text) // 4, 1) if prompt_text else 0
+        completion_tokens = max(len(content) // 4, 1)
+        total_tokens = prompt_tokens + completion_tokens
+
         return OpenAIChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
             object="chat.completion",
@@ -426,5 +431,9 @@ class GrokResponseProcessor:
                 ),
                 finish_reason="stop"
             )],
-            usage=None
+            usage={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens
+            }
         )

@@ -8,6 +8,7 @@ from curl_cffi.requests import AsyncSession
 
 from app.core.config import setting
 from app.core.logger import logger
+from app.core.retry import async_request_with_retry
 from app.services.grok.statsig import get_dynamic_headers
 
 
@@ -60,82 +61,52 @@ class CacheService:
             self._log("debug", "文件已缓存")
             return cache_path
 
-        # 外层重试：可配置状态码（401/429等）
-        retry_codes = setting.grok_config.get("retry_status_codes", [401, 429])
-        MAX_OUTER_RETRY = 3
-        
-        for outer_retry in range(MAX_OUTER_RETRY + 1):  # +1 确保实际重试3次
-            try:
-                # 内层重试：403代理池重试（cache使用缓存代理，不支持代理池，所以403只重试一次）
-                max_403_retries = 5
-                retry_403_count = 0
-                
-                while retry_403_count <= max_403_retries:
-                    proxy = await setting.get_proxy_async("cache")
-                    proxies = {"http": proxy, "https": proxy} if proxy else {}
-                    
-                    if proxy and outer_retry == 0 and retry_403_count == 0:
-                        self._log("debug", f"使用代理: {proxy.split('@')[-1] if '@' in proxy else proxy}")
+        log_prefix = f"[{self.cache_type.upper()}Cache]"
 
-                    async with AsyncSession() as session:
-                        url = f"{ASSETS_URL}{file_path}"
-                        if outer_retry == 0 and retry_403_count == 0:
-                            self._log("debug", f"下载: {url}")
-                        
-                        response = await session.get(
-                            url,
-                            headers=self._build_headers(file_path, auth_token),
-                            proxies=proxies,
-                            timeout=timeout or self.timeout,
-                            allow_redirects=True,
-                            impersonate="chrome133a"
-                        )
-                        
-                        # 检查403错误 - 内层重试(cache不使用代理池，所以直接失败)
-                        if response.status_code == 403:
-                            retry_403_count += 1
-                            
-                            if retry_403_count <= max_403_retries:
-                                self._log("warning", f"遇到403错误，正在重试 ({retry_403_count}/{max_403_retries})...")
-                                await asyncio.sleep(0.5)
-                                continue
-                            
-                            self._log("error", f"403错误，已重试{retry_403_count-1}次，放弃")
-                            return None
-                        
-                        # 检查可配置状态码错误 - 外层重试
-                        if response.status_code in retry_codes:
-                            if outer_retry < MAX_OUTER_RETRY:
-                                delay = (outer_retry + 1) * 0.1  # 渐进延迟：0.1s, 0.2s, 0.3s
-                                self._log("warning", f"遇到{response.status_code}错误，外层重试 ({outer_retry+1}/{MAX_OUTER_RETRY})，等待{delay}s...")
-                                await asyncio.sleep(delay)
-                                break  # 跳出内层循环，进入外层重试
-                            else:
-                                self._log("error", f"{response.status_code}错误，已重试{outer_retry}次，放弃")
-                                return None
-                        
-                        response.raise_for_status()
-                        await asyncio.to_thread(cache_path.write_bytes, response.content)
-                        
-                        if outer_retry > 0 or retry_403_count > 0:
-                            self._log("info", f"重试成功！")
-                        else:
-                            self._log("debug", "缓存成功")
-                        
-                        # 异步清理（带错误处理）
-                        asyncio.create_task(self._safe_cleanup())
-                        return cache_path
-                        
-            except Exception as e:
-                if outer_retry < MAX_OUTER_RETRY - 1:
-                    self._log("warning", f"下载异常: {e}，外层重试 ({outer_retry+1}/{MAX_OUTER_RETRY})...")
-                    await asyncio.sleep(0.5)
-                    continue
-                
-                self._log("error", f"下载失败: {e}（已重试{outer_retry}次）")
+        async def do_request(proxy, retry_info):
+            proxies = {"http": proxy, "https": proxy} if proxy else {}
+
+            if proxy and retry_info["outer_retry"] == 0 and retry_info["retry_403_count"] == 0:
+                self._log("debug", f"使用代理: {proxy.split('@')[-1] if '@' in proxy else proxy}")
+
+            async with AsyncSession() as session:
+                url = f"{ASSETS_URL}{file_path}"
+                if retry_info["outer_retry"] == 0 and retry_info["retry_403_count"] == 0:
+                    self._log("debug", f"下载: {url}")
+
+                response = await session.get(
+                    url,
+                    headers=self._build_headers(file_path, auth_token),
+                    proxies=proxies,
+                    timeout=timeout or self.timeout,
+                    allow_redirects=True,
+                    impersonate="chrome133a"
+                )
+
+                if response.status_code != 200:
+                    return {"status_code": response.status_code}
+
+                await asyncio.to_thread(cache_path.write_bytes, response.content)
+                return cache_path
+
+        try:
+            result = await async_request_with_retry(
+                do_request,
+                log_prefix=log_prefix,
+                proxy_type="cache",
+            )
+
+            if isinstance(result, dict) and "status_code" in result:
+                self._log("error", f"下载失败，状态码: {result['status_code']}")
                 return None
-        
-        return None
+
+            self._log("debug", "缓存成功")
+            asyncio.create_task(self._safe_cleanup())
+            return result
+
+        except Exception as e:
+            self._log("error", f"下载失败: {e}")
+            return None
 
     def get_cached(self, file_path: str) -> Optional[Path]:
         """获取已缓存的文件"""

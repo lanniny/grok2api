@@ -61,13 +61,16 @@ function base64UrlEncode(input: string): string {
 }
 
 function encodeAssetPath(raw: string): string {
+  // Extract file extension for URL hint (clients use it to identify image/video)
+  const extMatch = raw.match(/\.(jpe?g|png|gif|webp|mp4|webm|mov|avi)$/i);
+  const ext = extMatch ? extMatch[0].toLowerCase() : ".jpg";
   try {
     const u = new URL(raw);
     // Keep full URL (query etc.) to avoid lossy pathname-only encoding (some URLs may encode the real path in query).
-    return `u_${base64UrlEncode(u.toString())}`;
+    return `u_${base64UrlEncode(u.toString())}${ext}`;
   } catch {
     const p = raw.startsWith("/") ? raw : `/${raw}`;
-    return `p_${base64UrlEncode(p)}`;
+    return `p_${base64UrlEncode(p)}${ext}`;
   }
 }
 
@@ -250,9 +253,11 @@ export function createOpenAiStreamFromGrokNdjson(
                     const imgUrl = toImgProxyUrl(global, origin, imgPath);
                     linesOut.push(`![Generated Image](${imgUrl})`);
                   }
+                  // Blank line before images for proper markdown paragraph separation
+                  const imageContent = "\n\n" + linesOut.join("\n\n") + "\n";
                   // Send content and stop as SEPARATE chunks (OpenAI SSE convention)
                   controller.enqueue(
-                    encoder.encode(makeChunk(id, created, currentModel, linesOut.join("\n"))),
+                    encoder.encode(makeChunk(id, created, currentModel, imageContent)),
                   );
                   controller.enqueue(
                     encoder.encode(makeChunk(id, created, currentModel, "", "stop")),
@@ -388,7 +393,7 @@ export async function parseOpenAiFromGrokNdjson(
       if (typeof u !== "string") continue;
       const imgPath = encodeAssetPath(u);
       const imgUrl = toImgProxyUrl(global, origin, imgPath);
-      content += `\n![Generated Image](${imgUrl})`;
+      content += `\n\n![Generated Image](${imgUrl})`;
     }
     break;
   }

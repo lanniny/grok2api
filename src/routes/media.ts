@@ -152,7 +152,10 @@ function toUpstreamHeaders(args: { pathname: string; cookie: string; settings: A
 }
 
 mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
-  const imgPath = c.req.param("imgPath");
+  const rawImgPath = c.req.param("imgPath");
+  // Strip extension hint from encoded paths (e.g., p_xxx.jpg -> p_xxx)
+  // Extension is added by encodeAssetPath() for client compatibility but not part of the encoding
+  const imgPath = rawImgPath.replace(/\.(jpe?g|png|gif|webp|mp4|webm|mov|avi)$/i, "");
 
   let upstreamPath: string | null = null;
   let upstreamUrl: URL | null = null;

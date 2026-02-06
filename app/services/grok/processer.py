@@ -278,13 +278,13 @@ class GrokResponseProcessor:
                                     else:
                                         # URL模式 - 预缓存（失败不影响，/images/ 端点会按需下载）
                                         await image_cache_service.download_image(f"/{img}", auth_token)
-                                        content += f"![Generated Image]({proxy_url})\n"
+                                        content += f"![Generated Image]({proxy_url})\n\n"
                                 except Exception as e:
                                     logger.warning(f"[Processor] 处理图片失败: {e}")
-                                    content += f"![Generated Image]({proxy_url})\n"
+                                    content += f"![Generated Image]({proxy_url})\n\n"
 
-                            # Send content and stop as SEPARATE chunks (OpenAI SSE convention)
-                            yield make_chunk(content.strip())
+                            # Blank line before images for proper markdown paragraph separation
+                            yield make_chunk("\n\n" + content.strip() + "\n")
                             yield make_chunk("", "stop")
                             return
                         elif token:

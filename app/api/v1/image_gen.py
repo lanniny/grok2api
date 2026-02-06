@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from app.core.auth import auth_manager
 from app.core.config import setting
+from app.core.context import request_base_url
 from app.core.exception import GrokApiException
 from app.core.logger import logger
 from app.services.grok.client import GrokClient
@@ -44,6 +45,13 @@ async def create_image(
 
     try:
         logger.info(f"[ImageGen] [{request_id}] 图片生成请求: {key_name} @ {ip}, prompt={body.prompt[:50]}...")
+
+        # 自动检测 base_url
+        if not setting.global_config.get("base_url"):
+            host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+            scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+            if host:
+                request_base_url.set(f"{scheme}://{host}")
 
         # 构建 chat 请求，让 Grok 生成图片
         image_prompt = f"Generate {body.n} image(s): {body.prompt}"

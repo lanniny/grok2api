@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from app.core.auth import auth_manager
 from app.core.config import setting
+from app.core.context import request_base_url
 from app.core.exception import GrokApiException
 from app.core.logger import logger
 from app.services.grok.client import GrokClient
@@ -73,6 +74,13 @@ async def chat_completions(
     try:
         async with sem:
             logger.info(f"[Chat] [{request_id}] 收到聊天请求: {key_name} @ {ip}")
+
+            # 自动检测 base_url（未配置时从请求头推断）
+            if not setting.global_config.get("base_url"):
+                host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+                scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+                if host:
+                    request_base_url.set(f"{scheme}://{host}")
 
             # 调用Grok客户端
             result = await GrokClient.openai_to_grok(body.model_dump())

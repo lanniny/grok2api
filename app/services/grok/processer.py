@@ -7,6 +7,7 @@ import asyncio
 from typing import AsyncGenerator, Tuple, Any
 
 from app.core.config import setting
+from app.core.context import get_base_url
 from app.core.exception import GrokApiException
 from app.core.logger import logger
 from app.models.openai_schema import (
@@ -58,6 +59,12 @@ class StreamTimeoutManager:
 
 class GrokResponseProcessor:
     """Grok响应处理器"""
+
+    @staticmethod
+    def _image_proxy_url(img_path: str) -> str:
+        """构建图片代理 URL（始终通过本地 /images/ 端点，不直接暴露 assets.grok.com）"""
+        base_url = get_base_url()
+        return f"{base_url}/images/{img_path}" if base_url else f"/images/{img_path}"
 
     @staticmethod
     async def process_normal(response, auth_token: str, model: str = None) -> OpenAIChatCompletionResponse:
@@ -247,6 +254,7 @@ class GrokResponseProcessor:
                             content = ""
 
                             for img in model_resp.get("generatedImageUrls", []):
+                                proxy_url = GrokResponseProcessor._image_proxy_url(img)
                                 try:
                                     if image_mode == "base64":
                                         # Base64模式 - 分块发送
@@ -266,17 +274,14 @@ class GrokResponseProcessor:
                                             else:
                                                 yield make_chunk(f"![Generated Image]({base64_str})\n")
                                         else:
-                                            yield make_chunk(f"![Generated Image](https://assets.grok.com/{img})\n")
+                                            yield make_chunk(f"![Generated Image]({proxy_url})\n")
                                     else:
-                                        # URL模式
+                                        # URL模式 - 预缓存（失败不影响，/images/ 端点会按需下载）
                                         await image_cache_service.download_image(f"/{img}", auth_token)
-                                        img_path = img.replace('/', '-')
-                                        base_url = setting.global_config.get("base_url", "")
-                                        img_url = f"{base_url}/images/{img_path}" if base_url else f"/images/{img_path}"
-                                        content += f"![Generated Image]({img_url})\n"
+                                        content += f"![Generated Image]({proxy_url})\n"
                                 except Exception as e:
                                     logger.warning(f"[Processor] 处理图片失败: {e}")
-                                    content += f"![Generated Image](https://assets.grok.com/{img})\n"
+                                    content += f"![Generated Image]({proxy_url})\n"
 
                             yield make_chunk(content.strip(), "stop")
                             return
@@ -380,45 +385,36 @@ class GrokResponseProcessor:
     async def _build_video_content(video_url: str, auth_token: str) -> str:
         """构建视频内容"""
         logger.debug(f"[Processor] 检测到视频: {video_url}")
-        full_url = f"https://assets.grok.com/{video_url}"
-        
+        proxy_url = GrokResponseProcessor._image_proxy_url(video_url)
+
         try:
-            cache_path = await video_cache_service.download_video(f"/{video_url}", auth_token)
-            if cache_path:
-                video_path = video_url.replace('/', '-')
-                base_url = setting.global_config.get("base_url", "")
-                local_url = f"{base_url}/images/{video_path}" if base_url else f"/images/{video_path}"
-                return f'<video src="{local_url}" controls="controls" width="500" height="300"></video>\n'
+            await video_cache_service.download_video(f"/{video_url}", auth_token)
         except Exception as e:
-            logger.warning(f"[Processor] 缓存视频失败: {e}")
-        
-        return f'<video src="{full_url}" controls="controls" width="500" height="300"></video>\n'
+            logger.warning(f"[Processor] 预缓存视频失败: {e}")
+
+        return f'<video src="{proxy_url}" controls="controls" width="500" height="300"></video>\n'
 
     @staticmethod
     async def _append_images(content: str, images: list, auth_token: str) -> str:
         """追加图片到内容"""
         image_mode = setting.global_config.get("image_mode", "url")
-        
+
         for img in images:
+            proxy_url = GrokResponseProcessor._image_proxy_url(img)
             try:
                 if image_mode == "base64":
                     base64_str = await image_cache_service.download_base64(f"/{img}", auth_token)
                     if base64_str:
                         content += f"\n![Generated Image]({base64_str})"
                     else:
-                        content += f"\n![Generated Image](https://assets.grok.com/{img})"
+                        content += f"\n![Generated Image]({proxy_url})"
                 else:
-                    cache_path = await image_cache_service.download_image(f"/{img}", auth_token)
-                    if cache_path:
-                        img_path = img.replace('/', '-')
-                        base_url = setting.global_config.get("base_url", "")
-                        img_url = f"{base_url}/images/{img_path}" if base_url else f"/images/{img_path}"
-                        content += f"\n![Generated Image]({img_url})"
-                    else:
-                        content += f"\n![Generated Image](https://assets.grok.com/{img})"
+                    # 预缓存（失败不影响，/images/ 端点会按需下载）
+                    await image_cache_service.download_image(f"/{img}", auth_token)
+                    content += f"\n![Generated Image]({proxy_url})"
             except Exception as e:
                 logger.warning(f"[Processor] 处理图片失败: {e}")
-                content += f"\n![Generated Image](https://assets.grok.com/{img})"
+                content += f"\n![Generated Image]({proxy_url})"
         
         return content
 

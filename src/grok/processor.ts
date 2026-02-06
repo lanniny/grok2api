@@ -248,7 +248,7 @@ export function createOpenAiStreamFromGrokNdjson(
                 if (urls.length) {
                   const linesOut: string[] = [];
                   for (const u of urls) {
-                    if (typeof u !== "string") continue;
+                    if (typeof u !== "string" || !u) continue;
                     const imgPath = encodeAssetPath(u);
                     const imgUrl = toImgProxyUrl(global, origin, imgPath);
                     linesOut.push(`![Generated Image](${imgUrl})`);
@@ -390,7 +390,7 @@ export async function parseOpenAiFromGrokNdjson(
 
     const urls = Array.isArray(modelResp.generatedImageUrls) ? modelResp.generatedImageUrls : [];
     for (const u of urls) {
-      if (typeof u !== "string") continue;
+      if (typeof u !== "string" || !u) continue;
       const imgPath = encodeAssetPath(u);
       const imgUrl = toImgProxyUrl(global, origin, imgPath);
       content += `\n\n![Generated Image](${imgUrl})`;

@@ -243,8 +243,8 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
       const txt = await upstream.text().catch(() => "");
       // Record failure but don't aggressively cooldown for media downloads
       c.executionCtx.waitUntil(recordTokenFailure(c.env.DB, chosen.token, upstream.status, `media: ${txt.slice(0, 100)}`));
-      // Only cooldown for clear auth failures
-      if (upstream.status === 401) {
+      // Cooldown for auth failures (401/403)
+      if (upstream.status === 401 || upstream.status === 403) {
         c.executionCtx.waitUntil(applyCooldown(c.env.DB, chosen.token, upstream.status));
       }
       continue; // Try next token

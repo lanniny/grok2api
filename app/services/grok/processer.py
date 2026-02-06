@@ -254,6 +254,8 @@ class GrokResponseProcessor:
                             content = ""
 
                             for img in model_resp.get("generatedImageUrls", []):
+                                if not img:
+                                    continue
                                 proxy_url = GrokResponseProcessor._image_proxy_url(img)
                                 try:
                                     if image_mode == "base64":
@@ -402,6 +404,8 @@ class GrokResponseProcessor:
         image_mode = setting.global_config.get("image_mode", "url")
 
         for img in images:
+            if not img:
+                continue
             proxy_url = GrokResponseProcessor._image_proxy_url(img)
             try:
                 if image_mode == "base64":

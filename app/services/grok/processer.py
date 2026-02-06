@@ -115,6 +115,8 @@ class GrokResponseProcessor:
 
             raise GrokApiException("无响应数据", "NO_RESPONSE")
 
+        except GrokApiException:
+            raise  # 保留 CONTENT_MODERATED 等业务异常原样传播
         except orjson.JSONDecodeError as e:
             logger.error(f"[Processor] JSON解析失败: {e}")
             raise GrokApiException(f"JSON解析失败: {e}", "JSON_ERROR") from e

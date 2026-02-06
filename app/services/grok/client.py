@@ -281,6 +281,12 @@ class GrokClient:
 
                 return "SUCCESS"
 
+            except GrokApiException as e:
+                await session.close()
+                if e.error_code == "CONTENT_MODERATED":
+                    # 内容审核不需要重试，直接返回特殊标记让上层处理
+                    return {"content_moderated": True, "exception": e}
+                raise
             except Exception as e:
                 await session.close()
                 if "RequestsError" in str(type(e)):
@@ -288,6 +294,10 @@ class GrokClient:
                 raise
 
         result = await async_request_with_retry(do_request, log_prefix="[Client]")
+
+        # 内容审核快速通道：绕过 async_request_with_retry 的重试直接传播
+        if isinstance(result, dict) and result.get("content_moderated"):
+            raise result["exception"]
 
         # 处理重试用尽的情况
         if isinstance(result, dict) and "status_code" in result:
@@ -361,12 +371,17 @@ class GrokClient:
             except:
                 data = response.text
                 msg = data[:200] if data else "未知错误"
-        
+
+        # 检测内容审核（可能来自非200响应体）
+        error_code = "HTTP_ERROR"
+        if "content-moderated" in str(msg).lower():
+            error_code = "CONTENT_MODERATED"
+
         asyncio.create_task(token_manager.record_failure(token, response.status_code, msg))
         asyncio.create_task(token_manager.apply_cooldown(token, response.status_code))
         raise GrokApiException(
             f"请求失败: {response.status_code} - {msg}",
-            "HTTP_ERROR",
+            error_code,
             {"status": response.status_code, "data": data}
         )
 

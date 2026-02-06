@@ -73,6 +73,13 @@ def build_error_response(message: str, error_type: str, code: str = None, param:
     return {"error": error}
 
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+}
+
+
 async def http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
     """处理HTTP异常"""
     error_type, default_msg = HTTP_ERROR_MAP.get(exc.status_code, ("api_error", str(exc.detail)))
@@ -80,7 +87,8 @@ async def http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSO
 
     return JSONResponse(
         status_code=exc.status_code,
-        content=build_error_response(message, error_type)
+        content=build_error_response(message, error_type),
+        headers=CORS_HEADERS
     )
 
 
@@ -92,7 +100,8 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
 
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
-        content=build_error_response(message, "invalid_request_error", param=param)
+        content=build_error_response(message, "invalid_request_error", param=param),
+        headers=CORS_HEADERS
     )
 
 
@@ -103,7 +112,8 @@ async def grok_api_exception_handler(_: Request, exc: GrokApiException) -> JSONR
 
     return JSONResponse(
         status_code=http_status,
-        content=build_error_response(exc.message, error_type, exc.error_code)
+        content=build_error_response(exc.message, error_type, exc.error_code),
+        headers=CORS_HEADERS
     )
 
 
@@ -111,7 +121,8 @@ async def global_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     """处理未捕获异常"""
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=build_error_response("服务器遇到意外错误，请重试", "api_error")
+        content=build_error_response("服务器遇到意外错误，请重试", "api_error"),
+        headers=CORS_HEADERS
     )
 
 

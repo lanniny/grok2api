@@ -10,6 +10,7 @@ import { createPost } from "../grok/create";
 import { createOpenAiStreamFromGrokNdjson, parseOpenAiFromGrokNdjson } from "../grok/processor";
 import { addRequestLog } from "../repo/logs";
 import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
+import { enableNSFW } from "../grok/nsfw";
 import type { ApiAuthInfo } from "../auth";
 
 function openAiError(message: string, code: string): Record<string, unknown> {
@@ -130,12 +131,17 @@ openAiRoutes.post("/chat/completions", async (c) => {
     const stream = Boolean(body.stream);
     const maxRetry = 3;
     let lastErr: string | null = null;
+    let nsfwRetried = false;
+    let forceToken: string | null = null;
 
     for (let attempt = 0; attempt < maxRetry; attempt++) {
-      const chosen = await selectBestToken(c.env.DB, requestedModel);
+      const chosen: { token: string; token_type: string } | null = forceToken
+        ? { token: forceToken, token_type: "sso" }
+        : await selectBestToken(c.env.DB, requestedModel);
+      forceToken = null;
       if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
 
-      const jwt = chosen.token;
+      const jwt: string = chosen.token;
       const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
       const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
 
@@ -176,6 +182,16 @@ openAiRoutes.post("/chat/completions", async (c) => {
         if (!upstream.ok) {
           const txt = await upstream.text().catch(() => "");
           lastErr = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
+
+          // Content moderation: enable NSFW and retry with same token
+          if (txt.toLowerCase().includes("content-moderated") && !nsfwRetried) {
+            nsfwRetried = true;
+            await enableNSFW(jwt, settingsBundle.grok);
+            forceToken = jwt;
+            attempt--;
+            continue;
+          }
+
           await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
           await applyCooldown(c.env.DB, jwt, upstream.status);
           if (retryCodes.includes(upstream.status) && attempt < maxRetry - 1) continue;
@@ -183,7 +199,37 @@ openAiRoutes.post("/chat/completions", async (c) => {
         }
 
         if (stream) {
-          const sse = createOpenAiStreamFromGrokNdjson(upstream, {
+          // Pre-check for content moderation before committing to stream
+          let effectiveUpstream = upstream;
+          if (!nsfwRetried && upstream.body) {
+            const [peekStream, mainStream] = upstream.body.tee();
+            const peekReader = peekStream.getReader();
+            const firstChunk = await peekReader.read();
+            await peekReader.cancel();
+
+            let isModerated = false;
+            if (firstChunk.value) {
+              const text = new TextDecoder().decode(firstChunk.value);
+              isModerated = text.toLowerCase().includes("content-moderated");
+            }
+
+            if (isModerated) {
+              await mainStream.cancel();
+              nsfwRetried = true;
+              await enableNSFW(jwt, settingsBundle.grok);
+              forceToken = jwt;
+              attempt--;
+              continue;
+            }
+
+            // Use mainStream (retains all data including first chunk)
+            effectiveUpstream = new Response(mainStream, {
+              status: upstream.status,
+              headers: upstream.headers,
+            });
+          }
+
+          const sse = createOpenAiStreamFromGrokNdjson(effectiveUpstream, {
             cookie,
             settings: settingsBundle.grok,
             global: settingsBundle.global,
@@ -236,6 +282,16 @@ openAiRoutes.post("/chat/completions", async (c) => {
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         lastErr = msg;
+
+        // Content moderation in parsed response (non-stream)
+        if (msg.toLowerCase().includes("content-moderated") && !nsfwRetried) {
+          nsfwRetried = true;
+          await enableNSFW(jwt, settingsBundle.grok);
+          forceToken = jwt;
+          attempt--;
+          continue;
+        }
+
         await recordTokenFailure(c.env.DB, jwt, 500, msg);
         await applyCooldown(c.env.DB, jwt, 500);
         if (attempt < maxRetry - 1) continue;

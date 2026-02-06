@@ -252,12 +252,18 @@ export async function getAllTags(db: Env["DB"]): Promise<string[]> {
   return [...set].sort();
 }
 
-export async function selectBestToken(db: Env["DB"], model: string): Promise<{ token: string; token_type: TokenType } | null> {
+export async function selectBestToken(db: Env["DB"], model: string, excludeTokens?: string[]): Promise<{ token: string; token_type: TokenType } | null> {
   const now = nowMs();
   const isHeavy = model === "grok-4-heavy";
   const field = isHeavy ? "heavy_remaining_queries" : "remaining_queries";
 
   const pick = async (token_type: TokenType): Promise<{ token: string; token_type: TokenType } | null> => {
+    const params: unknown[] = [token_type, MAX_FAILURES, now];
+    let excludeClause = "";
+    if (excludeTokens && excludeTokens.length > 0) {
+      excludeClause = `AND token NOT IN (${excludeTokens.map(() => "?").join(",")})`;
+      params.push(...excludeTokens);
+    }
     const row = await dbFirst<{ token: string }>(
       db,
       `SELECT token FROM tokens
@@ -266,9 +272,10 @@ export async function selectBestToken(db: Env["DB"], model: string): Promise<{ t
          AND failed_count < ?
          AND (cooldown_until IS NULL OR cooldown_until <= ?)
          AND ${field} != 0
+         ${excludeClause}
        ORDER BY CASE WHEN ${field} = -1 THEN 0 ELSE 1 END, ${field} DESC, created_time ASC
        LIMIT 1`,
-      [token_type, MAX_FAILURES, now],
+      params,
     );
     return row ? { token: row.token, token_type } : null;
   };

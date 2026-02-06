@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import type { Env } from "../env";
 import { getSettings, normalizeCfCookie } from "../settings";
 import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
@@ -8,6 +9,15 @@ import { nowMs } from "../utils/time";
 import { nextLocalMidnightExpirationSeconds } from "../kv/cleanup";
 
 export const mediaRoutes = new Hono<{ Bindings: Env }>();
+
+mediaRoutes.use(
+  "/images/*",
+  cors({
+    origin: "*",
+    allowMethods: ["GET", "HEAD", "OPTIONS"],
+    maxAge: 86400,
+  }),
+);
 
 function guessCacheSeconds(path: string): number {
   const lower = path.toLowerCase();
@@ -207,80 +217,94 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   c.executionCtx.waitUntil(deleteCacheRow(c.env.DB, key));
 
   const settingsBundle = await getSettings(c.env);
-  const chosen = await selectBestToken(c.env.DB, "grok-4-fast");
-  if (!chosen) return c.text("No available token", 503);
-
-  const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
-  const cookie = cf ? `sso-rw=${chosen.token};sso=${chosen.token};${cf}` : `sso-rw=${chosen.token};sso=${chosen.token}`;
-
-  const baseHeaders = toUpstreamHeaders({ pathname: originalPath, cookie, settings: settingsBundle.grok });
-
-  // Range requests: KV can't stream partial content efficiently; proxy from upstream.
-  // (If the object is cached and within KV limits, we do support Range by slicing bytes above.)
-  const upstream = await fetch(url.toString(), { headers: rangeHeader ? { ...baseHeaders, Range: rangeHeader } : baseHeaders });
-  if (!upstream.ok || !upstream.body) {
-    const txt = await upstream.text().catch(() => "");
-    await recordTokenFailure(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200));
-    await applyCooldown(c.env.DB, chosen.token, upstream.status);
-    return new Response(`Upstream ${upstream.status}`, { status: upstream.status });
-  }
-
-  const contentType = upstream.headers.get("content-type") ?? "";
-  const contentLengthHeader = upstream.headers.get("content-length") ?? "";
-  const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
   const maxBytes = Math.min(25 * 1024 * 1024, Math.max(1, parseIntSafe(c.env.KV_CACHE_MAX_BYTES, 25 * 1024 * 1024)));
-  const shouldTryCache =
-    !rangeHeader &&
-    (!Number.isFinite(contentLength) || (contentLength > 0 && contentLength <= maxBytes));
 
-  if (shouldTryCache) {
-    const [toKvRaw, toClient] = upstream.body.tee();
-    const tzOffset = parseIntSafe(c.env.CACHE_RESET_TZ_OFFSET_MINUTES, 480);
-    const expiresAt = nextLocalMidnightExpirationSeconds(nowMs(), tzOffset);
+  // Retry download with different tokens
+  const MAX_DOWNLOAD_ATTEMPTS = 3;
+  const triedTokens: string[] = [];
 
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          let byteCount = 0;
-          const limiter = new TransformStream<Uint8Array, Uint8Array>({
-            transform(chunk, controller) {
-              byteCount += chunk.byteLength;
-              if (byteCount > maxBytes) throw new Error("KV value too large");
-              controller.enqueue(chunk);
-            },
-          });
-          const toKv = toKvRaw.pipeThrough(limiter);
+  for (let attempt = 0; attempt < MAX_DOWNLOAD_ATTEMPTS; attempt++) {
+    const chosen = await selectBestToken(c.env.DB, "grok-4-fast", triedTokens);
+    if (!chosen) break;
+    triedTokens.push(chosen.token);
 
-          await c.env.KV_CACHE.put(key, toKv, {
-            expiration: expiresAt,
-            metadata: { contentType, size: Number.isFinite(contentLength) ? contentLength : byteCount, type },
-          });
-          const now = nowMs();
-          await upsertCacheRow(c.env.DB, {
-            key,
-            type,
-            size: Number.isFinite(contentLength) ? contentLength : byteCount,
-            content_type: contentType,
-            created_at: now,
-            last_access_at: now,
-            expires_at: expiresAt * 1000,
-          });
-        } catch {
-          // ignore write errors
-        }
-      })(),
-    );
+    const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
+    const cookie = cf ? `sso-rw=${chosen.token};sso=${chosen.token};${cf}` : `sso-rw=${chosen.token};sso=${chosen.token}`;
+
+    const baseHeaders = toUpstreamHeaders({ pathname: originalPath, cookie, settings: settingsBundle.grok });
+
+    // Range requests: KV can't stream partial content efficiently; proxy from upstream.
+    // (If the object is cached and within KV limits, we do support Range by slicing bytes above.)
+    const upstream = await fetch(url.toString(), { headers: rangeHeader ? { ...baseHeaders, Range: rangeHeader } : baseHeaders });
+    if (!upstream.ok || !upstream.body) {
+      const txt = await upstream.text().catch(() => "");
+      // Record failure but don't aggressively cooldown for media downloads
+      c.executionCtx.waitUntil(recordTokenFailure(c.env.DB, chosen.token, upstream.status, `media: ${txt.slice(0, 100)}`));
+      // Only cooldown for clear auth failures
+      if (upstream.status === 401) {
+        c.executionCtx.waitUntil(applyCooldown(c.env.DB, chosen.token, upstream.status));
+      }
+      continue; // Try next token
+    }
+
+    const contentType = upstream.headers.get("content-type") ?? "";
+    const contentLengthHeader = upstream.headers.get("content-length") ?? "";
+    const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+    const shouldTryCache =
+      !rangeHeader &&
+      (!Number.isFinite(contentLength) || (contentLength > 0 && contentLength <= maxBytes));
+
+    if (shouldTryCache) {
+      const [toKvRaw, toClient] = upstream.body.tee();
+      const tzOffset = parseIntSafe(c.env.CACHE_RESET_TZ_OFFSET_MINUTES, 480);
+      const expiresAt = nextLocalMidnightExpirationSeconds(nowMs(), tzOffset);
+
+      c.executionCtx.waitUntil(
+        (async () => {
+          try {
+            let byteCount = 0;
+            const limiter = new TransformStream<Uint8Array, Uint8Array>({
+              transform(chunk, controller) {
+                byteCount += chunk.byteLength;
+                if (byteCount > maxBytes) throw new Error("KV value too large");
+                controller.enqueue(chunk);
+              },
+            });
+            const toKv = toKvRaw.pipeThrough(limiter);
+
+            await c.env.KV_CACHE.put(key, toKv, {
+              expiration: expiresAt,
+              metadata: { contentType, size: Number.isFinite(contentLength) ? contentLength : byteCount, type },
+            });
+            const now = nowMs();
+            await upsertCacheRow(c.env.DB, {
+              key,
+              type,
+              size: Number.isFinite(contentLength) ? contentLength : byteCount,
+              content_type: contentType,
+              created_at: now,
+              last_access_at: now,
+              expires_at: expiresAt * 1000,
+            });
+          } catch {
+            // ignore write errors
+          }
+        })(),
+      );
+
+      const outHeaders = new Headers(upstream.headers);
+      outHeaders.set("Access-Control-Allow-Origin", "*");
+      outHeaders.set("Cache-Control", `public, max-age=${cacheSeconds}`);
+      if (contentType) outHeaders.set("Content-Type", contentType);
+      return new Response(toClient, { status: upstream.status, headers: outHeaders });
+    }
 
     const outHeaders = new Headers(upstream.headers);
     outHeaders.set("Access-Control-Allow-Origin", "*");
     outHeaders.set("Cache-Control", `public, max-age=${cacheSeconds}`);
     if (contentType) outHeaders.set("Content-Type", contentType);
-    return new Response(toClient, { status: upstream.status, headers: outHeaders });
+    return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
   }
 
-  const outHeaders = new Headers(upstream.headers);
-  outHeaders.set("Access-Control-Allow-Origin", "*");
-  outHeaders.set("Cache-Control", `public, max-age=${cacheSeconds}`);
-  if (contentType) outHeaders.set("Content-Type", contentType);
-  return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
+  return c.text("Image not available", 404);
 });

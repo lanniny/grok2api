@@ -7,7 +7,7 @@ import { isValidModel, MODEL_CONFIG } from "../grok/models";
 import { buildConversationPayload, sendConversationRequest } from "../grok/conversation";
 import { parseOpenAiFromGrokNdjson, createOpenAiStreamFromGrokNdjson } from "../grok/processor";
 import { addRequestLog } from "../repo/logs";
-import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
+import { applyCooldown, recordTokenFailure, selectBestToken, updateTokenTags } from "../repo/tokens";
 import { enableNSFW } from "../grok/nsfw";
 import type { ApiAuthInfo } from "../auth";
 
@@ -75,7 +75,7 @@ imagesRoutes.post("/generations", async (c) => {
     let forceToken: string | null = null;
 
     for (let attempt = 0; attempt < maxRetry; attempt++) {
-      const chosen: { token: string; token_type: string } | null = forceToken
+      const chosen: { token: string; token_type: string; tags?: string[] } | null = forceToken
         ? { token: forceToken, token_type: "sso" }
         : await selectBestToken(c.env.DB, model);
       forceToken = null;
@@ -84,6 +84,15 @@ imagesRoutes.post("/generations", async (c) => {
       const jwt: string = chosen.token;
       const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
       const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
+
+      // 主动开启NSFW（仅对尚未开启的token）
+      if (settingsBundle.grok.auto_nsfw && chosen.tags && !chosen.tags.includes("nsfw")) {
+        const nsfwResult = await enableNSFW(jwt, settingsBundle.grok);
+        if (nsfwResult.success) {
+          const newTags = [...(chosen.tags ?? []), "nsfw"];
+          c.executionCtx.waitUntil(updateTokenTags(c.env.DB, jwt, chosen.token_type as any, newTags));
+        }
+      }
 
       try {
         // 构建图像生成 prompt

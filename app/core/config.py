@@ -24,6 +24,7 @@ DEFAULT_GROK = {
     "stream_chunk_timeout": 120,
     "stream_total_timeout": 600,
     "retry_status_codes": [401, 429],  # 可重试的HTTP状态码
+    "auto_nsfw": False,  # 自动开启NSFW模式（每个token首次请求时主动开启）
 }
 
 DEFAULT_GLOBAL = {

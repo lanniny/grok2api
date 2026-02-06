@@ -35,6 +35,7 @@ export interface GrokSettings {
   thinking?: boolean; // 默认思考模式
   timeout?: number;
   max_retry?: number;
+  auto_nsfw?: boolean; // 自动开启NSFW模式
 }
 
 export interface SettingsBundle {
@@ -75,6 +76,7 @@ const DEFAULTS: SettingsBundle = {
     thinking: false,
     timeout: 30000,
     max_retry: 3,
+    auto_nsfw: false,
   },
 };
 

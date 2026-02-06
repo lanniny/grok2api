@@ -27,8 +27,9 @@ MAX_UPLOADS = 20  # 提高并发上传限制以支持更高并发
 
 class GrokClient:
     """Grok API 客户端"""
-    
+
     _upload_sem = None  # 延迟初始化
+    _nsfw_enabled_tokens: set = set()  # 本次运行已开启NSFW的token
 
     @staticmethod
     def _get_upload_semaphore():
@@ -72,6 +73,12 @@ class GrokClient:
                     force_token = None
                 else:
                     token = await token_manager.get_token(model)
+
+                # 主动开启NSFW（仅首次）
+                if setting.grok_config.get("auto_nsfw", False) and token not in GrokClient._nsfw_enabled_tokens:
+                    await GrokClient._auto_enable_nsfw(token)
+                    GrokClient._nsfw_enabled_tokens.add(token)
+
                 img_ids, img_uris = await GrokClient._upload(images, token)
 
                 # 视频模型创建会话

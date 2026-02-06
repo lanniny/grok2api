@@ -252,21 +252,21 @@ export async function getAllTags(db: Env["DB"]): Promise<string[]> {
   return [...set].sort();
 }
 
-export async function selectBestToken(db: Env["DB"], model: string, excludeTokens?: string[]): Promise<{ token: string; token_type: TokenType } | null> {
+export async function selectBestToken(db: Env["DB"], model: string, excludeTokens?: string[]): Promise<{ token: string; token_type: TokenType; tags: string[] } | null> {
   const now = nowMs();
   const isHeavy = model === "grok-4-heavy";
   const field = isHeavy ? "heavy_remaining_queries" : "remaining_queries";
 
-  const pick = async (token_type: TokenType): Promise<{ token: string; token_type: TokenType } | null> => {
+  const pick = async (token_type: TokenType): Promise<{ token: string; token_type: TokenType; tags: string[] } | null> => {
     const params: unknown[] = [token_type, MAX_FAILURES, now];
     let excludeClause = "";
     if (excludeTokens && excludeTokens.length > 0) {
       excludeClause = `AND token NOT IN (${excludeTokens.map(() => "?").join(",")})`;
       params.push(...excludeTokens);
     }
-    const row = await dbFirst<{ token: string }>(
+    const row = await dbFirst<{ token: string; tags: string }>(
       db,
-      `SELECT token FROM tokens
+      `SELECT token, tags FROM tokens
        WHERE token_type = ?
          AND status != 'expired'
          AND failed_count < ?
@@ -277,7 +277,7 @@ export async function selectBestToken(db: Env["DB"], model: string, excludeToken
        LIMIT 1`,
       params,
     );
-    return row ? { token: row.token, token_type } : null;
+    return row ? { token: row.token, token_type, tags: parseTags(row.tags) } : null;
   };
 
   if (isHeavy) return pick("ssoSuper");

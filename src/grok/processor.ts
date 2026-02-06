@@ -250,8 +250,12 @@ export function createOpenAiStreamFromGrokNdjson(
                     const imgUrl = toImgProxyUrl(global, origin, imgPath);
                     linesOut.push(`![Generated Image](${imgUrl})`);
                   }
+                  // Send content and stop as SEPARATE chunks (OpenAI SSE convention)
                   controller.enqueue(
-                    encoder.encode(makeChunk(id, created, currentModel, linesOut.join("\n"), "stop")),
+                    encoder.encode(makeChunk(id, created, currentModel, linesOut.join("\n"))),
+                  );
+                  controller.enqueue(
+                    encoder.encode(makeChunk(id, created, currentModel, "", "stop")),
                   );
                   controller.enqueue(encoder.encode(makeDone()));
                   if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });

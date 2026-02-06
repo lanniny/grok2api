@@ -283,7 +283,9 @@ class GrokResponseProcessor:
                                     logger.warning(f"[Processor] 处理图片失败: {e}")
                                     content += f"![Generated Image]({proxy_url})\n"
 
-                            yield make_chunk(content.strip(), "stop")
+                            # Send content and stop as SEPARATE chunks (OpenAI SSE convention)
+                            yield make_chunk(content.strip())
+                            yield make_chunk("", "stop")
                             return
                         elif token:
                             yield make_chunk(token)

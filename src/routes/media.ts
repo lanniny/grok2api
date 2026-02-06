@@ -3,7 +3,6 @@ import { cors } from "hono/cors";
 import type { Env } from "../env";
 import { getSettings, normalizeCfCookie } from "../settings";
 import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
-import { getDynamicHeaders } from "../grok/headers";
 import { deleteCacheRow, touchCacheRow, upsertCacheRow, type CacheType } from "../repo/cache";
 import { nowMs } from "../utils/time";
 import { nextLocalMidnightExpirationSeconds } from "../kv/cleanup";
@@ -137,18 +136,22 @@ function responseFromBytes(args: {
 }
 
 function toUpstreamHeaders(args: { pathname: string; cookie: string; settings: Awaited<ReturnType<typeof getSettings>>["grok"] }): Record<string, string> {
-  const headers = getDynamicHeaders(args.settings, args.pathname);
-  headers.Cookie = args.cookie;
-  delete headers["Content-Type"];
-  headers.Accept =
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
-  headers["Sec-Fetch-Dest"] = "document";
-  headers["Sec-Fetch-Mode"] = "navigate";
-  headers["Sec-Fetch-Site"] = "same-site";
-  headers["Sec-Fetch-User"] = "?1";
-  headers["Upgrade-Insecure-Requests"] = "1";
-  headers.Referer = "https://grok.com/";
-  return headers;
+  // Use clean browser-like headers for asset downloads (NOT API headers).
+  // getDynamicHeaders adds x-statsig-id, Baggage, etc. which trigger CF bot detection on assets.grok.com.
+  return {
+    Cookie: args.cookie,
+    Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "image",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
+    Referer: "https://grok.com/",
+  };
 }
 
 mediaRoutes.get("/images/:imgPath{.+}", async (c) => {

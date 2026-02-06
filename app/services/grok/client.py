@@ -63,10 +63,15 @@ class GrokClient:
     async def _retry(model: str, content: str, images: List[str], grok_model: str, mode: str, is_video: bool, stream: bool):
         """重试请求"""
         last_err = None
+        force_token = None  # CONTENT_MODERATED 时强制复用同一 token
 
         for i in range(MAX_RETRY):
             try:
-                token = await token_manager.get_token(model)
+                if force_token:
+                    token = force_token
+                    force_token = None
+                else:
+                    token = await token_manager.get_token(model)
                 img_ids, img_uris = await GrokClient._upload(images, token)
 
                 # 视频模型创建会话
@@ -75,17 +80,33 @@ class GrokClient:
                     post_id = await GrokClient._create_post(img_ids[0], img_uris[0], token)
 
                 payload = GrokClient._build_payload(content, grok_model, mode, img_ids, img_uris, is_video, post_id)
-                return await GrokClient._request(payload, token, model, stream, post_id)
+                result = await GrokClient._request(payload, token, model, stream, post_id)
+
+                if not stream:
+                    return result
+
+                # 流式: 包装生成器以捕获迭代中的 CONTENT_MODERATED
+                return GrokClient._nsfw_retry_stream(result, token, payload, model, post_id)
 
             except GrokApiException as e:
                 last_err = e
+
+                # 内容审核: 自动开启 NSFW 并用同一 token 重试
+                if e.error_code == "CONTENT_MODERATED":
+                    logger.warning(f"[Client] 内容审核触发, 自动开启NSFW, 重试 {i+1}/{MAX_RETRY}")
+                    await GrokClient._auto_enable_nsfw(token)
+                    force_token = token
+                    if i < MAX_RETRY - 1:
+                        await asyncio.sleep(0.5)
+                    continue
+
                 # 检查是否可重试
                 if e.error_code not in ["HTTP_ERROR", "NO_AVAILABLE_TOKEN"]:
                     raise
 
                 status = e.context.get("status") if e.context else None
                 retry_codes = setting.grok_config.get("retry_status_codes", [401, 429])
-                
+
                 if status not in retry_codes:
                     raise
 
@@ -284,6 +305,39 @@ class GrokClient:
             )
         return _session_holder["result"]
 
+
+    @staticmethod
+    async def _nsfw_retry_stream(stream_gen, token: str, payload: dict, model: str, post_id: str = None):
+        """包装流式生成器，在迭代中捕获 CONTENT_MODERATED 并自动重试"""
+        try:
+            async for chunk in stream_gen:
+                yield chunk
+        except GrokApiException as e:
+            if e.error_code != "CONTENT_MODERATED":
+                raise
+            logger.warning("[Client] 流式响应内容审核, 自动开启NSFW并重试")
+            await GrokClient._auto_enable_nsfw(token)
+            await asyncio.sleep(0.5)
+            new_stream = await GrokClient._request(payload, token, model, True, post_id)
+            async for chunk in new_stream:
+                yield chunk
+
+    @staticmethod
+    async def _auto_enable_nsfw(auth_token: str):
+        """自动开启 NSFW 模式"""
+        try:
+            from app.services.grok.nsfw import enable_nsfw
+            sso = token_manager._extract_sso(auth_token)
+            if sso:
+                result = await enable_nsfw(sso)
+                if result.get("success"):
+                    logger.info(f"[Client] 自动开启NSFW成功: {sso[:10]}...")
+                else:
+                    logger.warning(f"[Client] 自动开启NSFW失败: {result.get('error', '未知')}")
+            else:
+                logger.warning("[Client] 无法提取SSO值, 跳过NSFW开启")
+        except Exception as e:
+            logger.warning(f"[Client] 自动开启NSFW异常: {e}")
 
     @staticmethod
     def _build_headers(token: str) -> Dict[str, str]:

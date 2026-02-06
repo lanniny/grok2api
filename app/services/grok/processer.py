@@ -72,9 +72,11 @@ class GrokResponseProcessor:
 
                 # 错误检查
                 if error := data.get("error"):
+                    error_msg = error.get('message', '未知错误')
+                    error_code = "CONTENT_MODERATED" if "content-moderated" in str(error_msg).lower() else "API_ERROR"
                     raise GrokApiException(
-                        f"API错误: {error.get('message', '未知错误')}",
-                        "API_ERROR",
+                        f"API错误: {error_msg}",
+                        error_code,
                         {"code": error.get("code")}
                     )
 
@@ -95,7 +97,8 @@ class GrokResponseProcessor:
                     continue
 
                 if error_msg := model_response.get("error"):
-                    raise GrokApiException(f"模型错误: {error_msg}", "MODEL_ERROR")
+                    error_code = "CONTENT_MODERATED" if "content-moderated" in str(error_msg).lower() else "MODEL_ERROR"
+                    raise GrokApiException(f"模型错误: {error_msg}", error_code)
 
                 # 构建内容
                 content = model_response.get("message", "")
@@ -183,6 +186,9 @@ class GrokResponseProcessor:
                     # 错误检查
                     if error := data.get("error"):
                         error_msg = error.get('message', '未知错误')
+                        # content-moderated 需要抛异常让上层重试
+                        if "content-moderated" in str(error_msg).lower():
+                            raise GrokApiException(f"API错误: {error_msg}", "CONTENT_MODERATED")
                         logger.error(f"[Processor] API错误: {error_msg}")
                         yield make_chunk(f"Error: {error_msg}", "stop")
                         yield "data: [DONE]\n\n"
@@ -334,6 +340,8 @@ class GrokResponseProcessor:
                             
                             is_thinking = current_is_thinking
 
+                except GrokApiException:
+                    raise  # 业务异常(如CONTENT_MODERATED)向上传播，供重试层处理
                 except (orjson.JSONDecodeError, UnicodeDecodeError) as e:
                     logger.warning(f"[Processor] 解析失败: {e}")
                     continue
@@ -345,6 +353,8 @@ class GrokResponseProcessor:
             yield "data: [DONE]\n\n"
             logger.info(f"[Processor] 流式完成，耗时: {timeout_mgr.duration():.2f}秒")
 
+        except GrokApiException:
+            raise  # 业务异常向上传播（CONTENT_MODERATED等），供客户端重试
         except Exception as e:
             logger.error(f"[Processor] 严重错误: {e}")
             yield make_chunk(f"处理错误: {e}", "error")

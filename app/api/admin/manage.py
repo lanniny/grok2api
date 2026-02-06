@@ -918,6 +918,123 @@ async def get_request_stats(_: bool = Depends(verify_admin_session)) -> Dict[str
         raise HTTPException(status_code=500, detail={"error": f"获取统计失败: {e}"})
 
 
+# === NSFW 模式管理 ===
+
+class NSFWRequest(BaseModel):
+    token: str
+    token_type: str = "sso"
+
+
+class NSFWBatchRequest(BaseModel):
+    tokens: List[Dict[str, str]]  # [{"token": "xxx", "token_type": "sso"}, ...]
+
+
+def _resolve_token_type(type_str: str) -> TokenType:
+    """解析 token_type 字符串"""
+    if type_str in ("ssoSuper", "super"):
+        return TokenType.SUPER
+    return TokenType.NORMAL
+
+
+@router.post("/api/tokens/nsfw/enable")
+async def enable_nsfw_endpoint(body: NSFWRequest, _: bool = Depends(verify_admin_session)) -> Dict[str, Any]:
+    """对单个 Token 开启 NSFW 模式"""
+    try:
+        from app.services.grok.nsfw import enable_nsfw
+
+        result = await enable_nsfw(body.token)
+
+        if result.get("success"):
+            # 添加 nsfw 标签
+            token_type = _resolve_token_type(body.token_type)
+            all_tokens = token_manager.get_tokens()
+            token_data = all_tokens.get(token_type.value, {}).get(body.token)
+            if token_data:
+                current_tags = token_data.get("tags", [])
+                if "nsfw" not in current_tags:
+                    current_tags.append("nsfw")
+                    await token_manager.update_token_tags(body.token, token_type, current_tags)
+
+        return result
+    except Exception as e:
+        logger.error(f"[Admin] 开启NSFW失败: {e}")
+        raise HTTPException(status_code=500, detail={"error": f"开启NSFW失败: {e}", "code": "NSFW_ENABLE_ERROR"})
+
+
+@router.post("/api/tokens/nsfw/disable")
+async def disable_nsfw_endpoint(body: NSFWRequest, _: bool = Depends(verify_admin_session)) -> Dict[str, Any]:
+    """对单个 Token 关闭 NSFW 模式"""
+    try:
+        from app.services.grok.nsfw import disable_nsfw
+
+        result = await disable_nsfw(body.token)
+
+        if result.get("success"):
+            # 移除 nsfw 标签
+            token_type = _resolve_token_type(body.token_type)
+            all_tokens = token_manager.get_tokens()
+            token_data = all_tokens.get(token_type.value, {}).get(body.token)
+            if token_data:
+                current_tags = token_data.get("tags", [])
+                if "nsfw" in current_tags:
+                    current_tags.remove("nsfw")
+                    await token_manager.update_token_tags(body.token, token_type, current_tags)
+
+        return result
+    except Exception as e:
+        logger.error(f"[Admin] 关闭NSFW失败: {e}")
+        raise HTTPException(status_code=500, detail={"error": f"关闭NSFW失败: {e}", "code": "NSFW_DISABLE_ERROR"})
+
+
+@router.post("/api/tokens/nsfw/enable-batch")
+async def enable_nsfw_batch(body: NSFWBatchRequest, _: bool = Depends(verify_admin_session)) -> Dict[str, Any]:
+    """批量开启 NSFW 模式（后台执行）"""
+    import asyncio
+
+    try:
+        tokens = body.tokens
+        if not tokens:
+            return {"success": False, "message": "Token列表不能为空"}
+
+        from app.services.grok.nsfw import enable_nsfw
+
+        async def _batch_enable():
+            success_count = 0
+            fail_count = 0
+
+            for t in tokens:
+                sso = t.get("token", "")
+                tt_str = t.get("token_type", "sso")
+                if not sso:
+                    fail_count += 1
+                    continue
+
+                result = await enable_nsfw(sso)
+                if result.get("success"):
+                    success_count += 1
+                    token_type = _resolve_token_type(tt_str)
+                    all_tokens = token_manager.get_tokens()
+                    token_data = all_tokens.get(token_type.value, {}).get(sso)
+                    if token_data:
+                        current_tags = token_data.get("tags", [])
+                        if "nsfw" not in current_tags:
+                            current_tags.append("nsfw")
+                            await token_manager.update_token_tags(sso, token_type, current_tags)
+                else:
+                    fail_count += 1
+
+                await asyncio.sleep(0.2)  # 避免过快
+
+            logger.info(f"[Admin] 批量NSFW完成: 成功{success_count}, 失败{fail_count}")
+
+        asyncio.create_task(_batch_enable())
+        return {"success": True, "message": f"批量NSFW开启任务已启动，共 {len(tokens)} 个Token"}
+
+    except Exception as e:
+        logger.error(f"[Admin] 批量NSFW失败: {e}")
+        raise HTTPException(status_code=500, detail={"error": f"批量NSFW失败: {e}", "code": "NSFW_BATCH_ERROR"})
+
+
 # === API Key 管理 ===
 
 class AddKeyRequest(BaseModel):
